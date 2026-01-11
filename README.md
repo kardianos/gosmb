@@ -2,8 +2,8 @@
 
 A Go userspace daemon for the Linux kernel's ksmbd SMB server. This library provides:
 
-- **gosmb**: Core SMB server daemon that communicates with the ksmbd kernel module via netlink
-- **vfs**: A FUSE-based virtual filesystem backend for serving per-user virtual files over SMB
+- **smbsys**: Core SMB server daemon that communicates with the ksmbd kernel module via netlink
+- **smbvfs**: A FUSE-based virtual filesystem backend for serving per-user virtual files over SMB
 
 ## Requirements
 
@@ -21,56 +21,95 @@ go get github.com/kardianos/gosmb
 
 ### Basic Server
 
-```go
-package main
-
-import "github.com/kardianos/gosmb"
-
-func main() {
-    // Use secure defaults (signing enabled, encryption enabled, SMB 3.0+)
-    cfg := gosmb.DefaultServerConfig()
-    gosmb.SetServerConfig(cfg)
-
-    // Start the SMB server (blocks forever)
-    gosmb.Run()
-}
-```
-
-### With Virtual Filesystem
+See [smbsys/example_test.go](smbsys/example_test.go) for complete examples.
 
 ```go
 package main
 
 import (
-    "github.com/kardianos/gosmb"
-    "github.com/kardianos/gosmb/vfs"
+	"context"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/kardianos/gosmb/smbsys"
 )
 
 func main() {
-    // Create an in-memory filesystem handler
-    handler := vfs.NewMemoryFSHandler()
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
 
-    // Initialize per-user files
-    handler.InitUser("alice", map[string][]byte{
-        "hello.txt":         []byte("Hello, Alice!"),
-        "docs/readme.txt":   []byte("Alice's documents"),
-    })
-    handler.InitUser("bob", map[string][]byte{
-        "hello.txt":         []byte("Hello, Bob!"),
-    })
+	sys := smbsys.NewSys()
+	err := sys.Start(ctx, smbsys.SysOpt{
+		Logger: smbsys.NewLogger(os.Stderr),
+		Config: smbsys.DefaultServerConfig(),
+		ShareProvider: smbsys.NewFSShareProvider([]smbsys.FSShare{
+			{ShareInfo: smbsys.ShareInfo{Name: "documents"}, Path: "/srv/samba/documents"},
+		}),
+		Authenticator: smbsys.NewStaticUserAuthenticator(map[string]*smbsys.UserCredentials{
+			"alice": {PasswordHash: smbsys.NewPassHash("alice-password")},
+		}),
+	})
+	if err != nil {
+		os.Exit(1)
+	}
+	sys.Wait()
+}
+```
 
-    // Create FUSE backend (mounts at /run/gosmb-vfs)
-    backend, err := vfs.NewBackend(vfs.DefaultMountPoint, handler)
-    if err != nil {
-        panic(err)
-    }
-    defer backend.Close()
+### With Virtual Filesystem
 
-    // Register backend for the share
-    gosmb.RegisterBackend("memshare", backend)
+See [smbvfs/example_test.go](smbvfs/example_test.go) for complete examples.
 
-    // Start server
-    gosmb.Run()
+```go
+package main
+
+import (
+	"context"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/kardianos/gosmb/smbsys"
+	"github.com/kardianos/gosmb/smbvfs"
+)
+
+func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	// Create an in-memory filesystem handler with per-user files
+	handler := smbvfs.NewMemoryFSHandler()
+	handler.InitUser("alice", map[string][]byte{
+		"hello.txt":       []byte("Hello, Alice!"),
+		"docs/readme.txt": []byte("Alice's documents"),
+	})
+	handler.InitUser("bob", map[string][]byte{
+		"hello.txt": []byte("Hello, Bob!"),
+	})
+
+	// Create FUSE backend (mounts at /run/gosmb-vfs)
+	backend, err := smbvfs.NewBackend(smbvfs.DefaultMountPoint, handler)
+	if err != nil {
+		panic(err)
+	}
+	defer backend.Close()
+
+	// Start server with VFS backend as the share provider
+	sys := smbsys.NewSys()
+	err = sys.Start(ctx, smbsys.SysOpt{
+		Logger:        smbsys.NewLogger(os.Stderr),
+		Config:        smbsys.DefaultServerConfig(),
+		ShareProvider: backend,
+		Authenticator: smbsys.NewStaticUserAuthenticator(map[string]*smbsys.UserCredentials{
+			"alice": {PasswordHash: smbsys.NewPassHash("alice-pass")},
+			"bob":   {PasswordHash: smbsys.NewPassHash("bob-pass")},
+		}),
+	})
+	if err != nil {
+		os.Exit(1)
+	}
+	sys.Wait()
 }
 ```
 
@@ -80,30 +119,29 @@ func main() {
 
 ```go
 // Default configuration (recommended for most uses)
-cfg := gosmb.DefaultServerConfig()
+cfg := smbsys.DefaultServerConfig()
 // - Signing: SigningEnabled
 // - Encryption: true
 // - MinProtocol: "SMB300" (no SMB1/SMB2.0)
 // - MaxProtocol: "SMB311"
 
 // High-security configuration
-cfg := gosmb.SecureServerConfig()
+cfg := smbsys.SecureServerConfig()
 // - Signing: SigningMandatory (rejects clients without signing)
 
 // Custom configuration
-cfg := gosmb.ServerConfig{
-    Signing:           gosmb.SigningMandatory, // 0=Disabled, 1=Enabled, 2=Auto, 3=Mandatory
-    Encryption:        true,                    // Enable SMB3 encryption
-    RequireEncryption: false,                   // Only allow encrypted connections
-    MinProtocol:       "SMB300",                // Minimum SMB version
-    MaxProtocol:       "SMB311",                // Maximum SMB version
-    TCPPort:           445,                     // SMB port
-    NetBIOSName:       "MY-SERVER",
-    WorkGroup:         "WORKGROUP",
-    ServerString:      "My SMB Server",
-    MaxConnections:    100,
+cfg := smbsys.ServerConfig{
+	Signing:           smbsys.SigningMandatory,
+	Encryption:        true,
+	RequireEncryption: false,
+	MinProtocol:       smbsys.ProtocolSMB300,
+	MaxProtocol:       smbsys.ProtocolSMB311,
+	TCPPort:           445,
+	NetBIOSName:       "MY-SERVER",
+	WorkGroup:         "WORKGROUP",
+	ServerString:      "My SMB Server",
+	MaxConnections:    100,
 }
-gosmb.SetServerConfig(cfg)
 ```
 
 ### Signing Options
@@ -115,58 +153,105 @@ gosmb.SetServerConfig(cfg)
 | 2 | `SigningAuto` | Let ksmbd decide |
 | 3 | `SigningMandatory` | Require signing (RECOMMENDED for production) |
 
+### Share Configuration
+
+Shares are configured via the `ShareProvider` interface. Use `FSShareProvider` for filesystem-backed shares:
+
+```go
+shares := smbsys.NewFSShareProvider([]smbsys.FSShare{
+	{
+		ShareInfo: smbsys.ShareInfo{
+			Name:              "documents",
+			Comment:           "Shared Documents",
+			Hidden:            false,  // Visible in browse lists
+			ReadOnly:          false,
+			CreateMask:        0644,   // Permission mask for new files
+			DirectoryMask:     0755,   // Permission mask for new directories
+			ForceUID:          1000,   // Force files to appear owned by this UID
+			ForceGID:          1000,
+		},
+		Path: "/srv/samba/documents",
+	},
+})
+```
+
 ## VFS Package
 
-The `vfs` package provides a FUSE-based virtual filesystem that enables per-user file views over SMB.
+The `smbvfs` package provides a FUSE-based virtual filesystem that enables per-user file views over SMB.
 
 ### FSHandler Interface
 
-Implement `vfs.FSHandler` to provide custom filesystem logic:
+Implement `smbvfs.FSHandler` to provide custom filesystem logic. All methods receive a `Session` containing the authenticated user, share name, and session handle.
 
 ```go
 type FSHandler interface {
-    Getattr(ctx context.Context, user, path string) (*Attr, error)
-    Lookup(ctx context.Context, user, path string) (*Attr, error)
-    ReadDir(ctx context.Context, user, path string) ([]DirEntry, error)
-    Read(ctx context.Context, user, path string, dest []byte, offset int64) (int, error)
-    Write(ctx context.Context, user, path string, data []byte, offset int64) (int, error)
-    Create(ctx context.Context, user, path string, mode uint32) error
-    Mkdir(ctx context.Context, user, path string, mode uint32) error
-    Remove(ctx context.Context, user, path string) error
-    Rename(ctx context.Context, user, oldPath, newPath string) error
-    Truncate(ctx context.Context, user, path string, size uint64) error
-    SetAttr(ctx context.Context, user, path string, attr *Attr) error
+	Getattr(ctx context.Context, s Session, path string) (*Attr, error)
+	Lookup(ctx context.Context, s Session, path string) (*Attr, error)
+	ReadDir(ctx context.Context, s Session, path string) ([]DirEntry, error)
+	Read(ctx context.Context, s Session, path string, dest []byte, offset int64) (int, error)
+	Write(ctx context.Context, s Session, path string, data []byte, offset int64) (int, error)
+	Create(ctx context.Context, s Session, path string, mode uint32) error
+	Mkdir(ctx context.Context, s Session, path string, mode uint32) error
+	Remove(ctx context.Context, s Session, path string) error
+	Rename(ctx context.Context, s Session, oldPath, newPath string) error
+	Truncate(ctx context.Context, s Session, path string, size uint64) error
+	SetAttr(ctx context.Context, s Session, path string, attr *Attr) error
 }
+
+// Session identifies the user and share for a filesystem operation
+type Session struct {
+	User   string // Authenticated username
+	Share  string // Share name being accessed
+	Handle uint32 // ksmbd session handle
+}
+```
+
+### Custom Errors
+
+FSHandler methods should return these errors for proper translation to SMB/FUSE error codes:
+
+```go
+var (
+	ErrReadOnly   = errors.New("read-only filesystem")  // EROFS
+	ErrNotFound   = errors.New("file not found")        // ENOENT
+	ErrExists     = errors.New("file exists")           // EEXIST
+	ErrNotEmpty   = errors.New("directory not empty")   // ENOTEMPTY
+	ErrIsDir      = errors.New("is a directory")        // EISDIR
+	ErrNotDir     = errors.New("not a directory")       // ENOTDIR
+	ErrPermission = errors.New("permission denied")     // EACCES
+	ErrInvalidArg = errors.New("invalid argument")      // EINVAL
+)
 ```
 
 ### Read-Only Handler
 
-Embed `vfs.ReadOnlyHandler` to get default read-only implementations:
+Embed `smbvfs.ReadOnlyHandler` to get default read-only implementations:
 
 ```go
 type MyHandler struct {
-    vfs.ReadOnlyHandler // Embeds EROFS responses for write operations
+	smbvfs.ReadOnlyHandler // Returns ErrReadOnly for all write operations
 }
 
-func (h *MyHandler) Getattr(ctx context.Context, user, path string) (*vfs.Attr, error) {
-    // Your implementation
+func (h *MyHandler) Getattr(ctx context.Context, s smbvfs.Session, path string) (*smbvfs.Attr, error) {
+	// Your implementation
 }
 // ... implement read operations only
 ```
 
 ### Built-in Handlers
 
-- **MemoryFSHandler**: In-memory per-user filesystem (good for testing)
+- **MemoryFSHandler**: In-memory per-user filesystem (good for testing and dynamic content)
 
 ### Backend Options
 
 ```go
 // Default options (secure)
-opts := vfs.DefaultBackendOptions()
+opts := smbvfs.DefaultBackendOptions()
 // - AllowRoot: true (only root can access FUSE mount)
+// - ShareName: "vfs"
 
 // Create with options
-backend, err := vfs.NewBackendWithOptions("/run/gosmb-vfs", handler, opts)
+backend, err := smbvfs.NewBackendWithOptions("/run/gosmb-vfs", handler, opts)
 ```
 
 ### Security Features
@@ -206,15 +291,15 @@ go test -c -o test-smbvfs ./smbvfs && sudo ./test-smbvfs; rm test-smbvfs
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│ SMB Client  │────▶│    ksmbd     │────▶│   gosmb     │
+│ SMB Client  │────▶│    ksmbd     │────▶│   smbsys    │
 │ (Windows,   │     │   (kernel)   │     │ (userspace) │
 │  smbclient) │     └──────────────┘     └──────┬──────┘
 └─────────────┘            │                    │
-                           │ netlink            │ RegisterBackend()
+                           │ netlink            │ ShareProvider
                            │                    ▼
                     ┌──────▼──────┐     ┌──────────────┐
-                    │   Shared    │◀────│ vfs.Backend  │
-                    │ Filesystem  │     │   (FUSE)     │
+                    │   Shared    │◀────│ smbvfs       │
+                    │ Filesystem  │     │ (FUSE)       │
                     └─────────────┘     └──────┬───────┘
                                                │
                                         ┌──────▼───────┐
@@ -225,21 +310,17 @@ go test -c -o test-smbvfs ./smbvfs && sudo ./test-smbvfs; rm test-smbvfs
 
 ### Session Flow
 
-1. **LOGIN_REQUEST**: User authenticates, gosmb validates credentials
-2. **SHARE_CONFIG_REQUEST**: ksmbd requests share path, gosmb returns session-specific FUSE path
-3. **TREE_CONNECT_REQUEST**: User connects to share
-4. File operations go through FUSE → FSHandler with user context
+1. **LOGIN_REQUEST**: User authenticates via `UserAuthenticator`
+2. **SHARE_CONFIG_REQUEST**: ksmbd requests share path via `ShareProvider.PathForSession()`
+3. **TREE_CONNECT_REQUEST**: User connects to share, `ShareProvider.OnTreeConnect()` called
+4. File operations go through FUSE → FSHandler with `Session` context
 
-## Share Configuration
+## Examples
 
-Shares are defined in `gosmb.Shares`:
+See the example files for complete, runnable code:
 
-```go
-var Shares = []ShareDef{
-    {Name: "memshare", Path: "/tmp/gosmb_test", Type: 0, Comment: ""},
-    {Name: "IPC$", Path: "/dev/null", Type: 0x80000003, Comment: "IPC"},
-}
-```
+- [smbsys/example_test.go](smbsys/example_test.go) - Server configuration, authentication, shares
+- [smbvfs/example_test.go](smbvfs/example_test.go) - FSHandler implementation, memory handler, custom handlers
 
 ## License
 
