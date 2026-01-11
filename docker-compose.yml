@@ -1,0 +1,23 @@
+services:
+  test:
+    build: .
+    privileged: true
+    pid: host
+    volumes:
+      - /lib/modules:/lib/modules:ro
+      - /tmp:/tmp
+    network_mode: host
+    command: ["go", "test", "-v", "-count=1", "./..."]
+
+  shell:
+    build: .
+    privileged: true
+    pid: host
+    volumes:
+      - /lib/modules:/lib/modules:ro
+      - /tmp:/tmp
+      - .:/app
+    network_mode: host
+    stdin_open: true
+    tty: true
+    command: ["/bin/sh"]

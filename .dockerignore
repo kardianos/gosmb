@@ -1,0 +1,14 @@
+# VM files (large kernel source and rootfs)
+vm/
+# Test artifacts
+smb_test_bin
+*.test
+# Git
+.git/
+# Reference materials
+ref/
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*~
