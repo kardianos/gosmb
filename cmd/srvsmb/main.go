@@ -21,7 +21,7 @@ func main() {
 		ShareProvider: smbsys.NewFSShareProvider([]smbsys.FSShare{
 			{ShareInfo: smbsys.ShareInfo{Name: "memshare"}, Path: "/tmp/gosmb_test"},
 		}),
-		Authenticator: smbsys.NewStaticUserAuthenticator(map[string]*smbsys.UserCredentials{
+		NTLMAuthenticator: smbsys.NewStaticNTLMAuthenticator(map[string]*smbsys.UserCredentials{
 			"testuser": {PasswordHash: smbsys.NewPassHash("my-pass")},
 		}),
 	})

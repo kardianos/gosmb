@@ -170,6 +170,32 @@ func setupTestMountPoint(t *testing.T) string {
 	return mountPoint
 }
 
+// TestAuthenticatorValidation verifies that at least one authenticator is required.
+func TestAuthenticatorValidation(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("Test must be run as root")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Test: No authenticators should fail
+	sys := NewSys()
+	err := sys.Start(ctx, SysOpt{
+		Config: DefaultServerConfig(),
+		ShareProvider: NewFSShareProvider([]FSShare{
+			{ShareInfo: ShareInfo{Name: "test"}, Path: "/tmp"},
+		}),
+		// No authenticators set
+	})
+	if err == nil {
+		t.Fatal("Expected error when no authenticators provided")
+	}
+	if !strings.Contains(err.Error(), "at least one") {
+		t.Errorf("Expected 'at least one' error, got: %v", err)
+	}
+}
+
 func TestIntegration(t *testing.T) {
 	const runDMSG = false
 
@@ -205,7 +231,7 @@ func TestIntegration(t *testing.T) {
 		ShareProvider: NewFSShareProvider([]FSShare{
 			{ShareInfo: ShareInfo{Name: "memshare"}, Path: mountPoint},
 		}),
-		Authenticator: NewStaticUserAuthenticator(map[string]*UserCredentials{
+		NTLMAuthenticator: NewStaticNTLMAuthenticator(map[string]*UserCredentials{
 			testUser: {PasswordHash: NewPassHash(testPassword)},
 		}),
 	})

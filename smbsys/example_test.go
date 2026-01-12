@@ -39,7 +39,7 @@ func Example_basicServer() {
 				Path: "/srv/samba/private",
 			},
 		}),
-		Authenticator: smbsys.NewStaticUserAuthenticator(map[string]*smbsys.UserCredentials{
+		NTLMAuthenticator: smbsys.NewStaticNTLMAuthenticator(map[string]*smbsys.UserCredentials{
 			"alice": {PasswordHash: smbsys.NewPassHash("alice-password"), UID: 1000, GID: 1000},
 			"bob":   {PasswordHash: smbsys.NewPassHash("bob-password"), UID: 1001, GID: 1001},
 		}),
@@ -70,7 +70,7 @@ func Example_secureServer() {
 		ShareProvider: smbsys.NewFSShareProvider([]smbsys.FSShare{
 			{ShareInfo: smbsys.ShareInfo{Name: "secure"}, Path: "/srv/secure"},
 		}),
-		Authenticator: smbsys.NewStaticUserAuthenticator(map[string]*smbsys.UserCredentials{
+		NTLMAuthenticator: smbsys.NewStaticNTLMAuthenticator(map[string]*smbsys.UserCredentials{
 			"admin": {PasswordHash: smbsys.NewPassHash("secure-password")},
 		}),
 	})
@@ -80,13 +80,13 @@ func Example_secureServer() {
 	sys.Wait()
 }
 
-// DatabaseAuthenticator is an example of a custom authenticator.
+// DatabaseAuthenticator is an example of a custom NTLM authenticator.
 // In practice, this would connect to a database, LDAP, etc.
 type DatabaseAuthenticator struct {
 	// db *sql.DB // database connection
 }
 
-// Authenticate implements smbsys.UserAuthenticator.
+// Authenticate implements smbsys.NTLMAuthenticator.
 func (a *DatabaseAuthenticator) Authenticate(handle uint32, username string) (*smbsys.UserCredentials, error) {
 	// In practice, look up the user in a database:
 	// user, err := a.db.FindUser(username)
@@ -108,15 +108,15 @@ func (a *DatabaseAuthenticator) Authenticate(handle uint32, username string) (*s
 }
 
 // Verify interface implementation at compile time
-var _ smbsys.UserAuthenticator = (*DatabaseAuthenticator)(nil)
+var _ smbsys.NTLMAuthenticator = (*DatabaseAuthenticator)(nil)
 
-// Example_customAuthentication demonstrates implementing a custom authenticator.
+// Example_customAuthentication demonstrates implementing a custom NTLM authenticator.
 func Example_customAuthentication() {
 	auth := &DatabaseAuthenticator{}
 
 	// Use the custom authenticator with the server
 	_ = smbsys.SysOpt{
-		Authenticator: auth,
+		NTLMAuthenticator: auth,
 	}
 }
 
@@ -140,6 +140,40 @@ func Example_sharePermissions() {
 
 	provider := smbsys.NewFSShareProvider(shares)
 	_ = provider
+}
+
+// Example_dualAuthentication demonstrates configuring both Kerberos and NTLM.
+// Clients will use Kerberos when available and fall back to NTLM.
+func Example_dualAuthentication() {
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	// KerberosAuthenticator would be created using:
+	// serviceAuth, err := krb5.NewServiceAuthenticator(krb5.ServiceAuthenticatorConfig{
+	//     Principal: "cifs/server.example.com",
+	//     Realm:     "EXAMPLE.COM",
+	//     Password:  "service-key-secret", // Or use Keytab field
+	// })
+
+	sys := smbsys.NewSys()
+	err := sys.Start(ctx, smbsys.SysOpt{
+		Logger: smbsys.NewLogger(os.Stderr),
+		Config: smbsys.DefaultServerConfig(),
+		ShareProvider: smbsys.NewFSShareProvider([]smbsys.FSShare{
+			{ShareInfo: smbsys.ShareInfo{Name: "shared"}, Path: "/srv/shared"},
+		}),
+		// Kerberos for domain-joined clients
+		// KerberosAuthenticator: serviceAuth,
+
+		// NTLM fallback for non-domain clients
+		NTLMAuthenticator: smbsys.NewStaticNTLMAuthenticator(map[string]*smbsys.UserCredentials{
+			"alice": {PasswordHash: smbsys.NewPassHash("alice-password")},
+		}),
+	})
+	if err != nil {
+		return
+	}
+	sys.Wait()
 }
 
 // ExampleNewPassHash demonstrates creating password hashes.

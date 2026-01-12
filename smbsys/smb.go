@@ -71,31 +71,40 @@ type UserCredentials struct {
 	GID          uint32
 }
 
-// UserAuthenticator provides user authentication for the SMB server.
-// Implement this interface to provide custom authentication logic.
-type UserAuthenticator interface {
+// NTLMAuthenticator provides NTLM-based user authentication for the SMB server.
+// This authenticator is used for NTLMv2 authentication (the default for modern
+// Windows clients when Kerberos is not available).
+//
+// Implement this interface to provide custom NTLM authentication logic.
+// For Kerberos-based authentication, implement KerberosAuthenticator instead.
+//
+// At least one of NTLMAuthenticator or KerberosAuthenticator must be provided
+// when starting the SMB server.
+type NTLMAuthenticator interface {
 	// Authenticate checks if the given username exists and returns credentials.
 	// Return credentials, nil if the user exists.
 	// Return nil, nil if the user doesn't exist (login will be rejected).
 	// Return nil, error if there was an error during authentication.
 	//
 	// Note: PasswordHash must be the NTLM hash (MD4 of UTF-16LE password) because
-	// the kernel uses it to verify the client's NTLM challenge-response.
+	// the kernel uses it to verify the client's NTLMv2 challenge-response.
 	Authenticate(handle uint32, username string) (*UserCredentials, error)
 }
 
-// StaticUserAuthenticator is a simple authenticator that uses a static user list.
-type StaticUserAuthenticator struct {
+// StaticNTLMAuthenticator is a simple NTLM authenticator that uses a static user list.
+// Use NewPassHash to compute the NTLM hash from a plain-text password.
+type StaticNTLMAuthenticator struct {
 	Users map[string]*UserCredentials
 }
 
-// NewStaticUserAuthenticator creates a new static authenticator from a user map.
-func NewStaticUserAuthenticator(users map[string]*UserCredentials) *StaticUserAuthenticator {
-	return &StaticUserAuthenticator{Users: users}
+// NewStaticNTLMAuthenticator creates a new static NTLM authenticator from a user map.
+// The UserCredentials.PasswordHash must contain the NTLM hash (use NewPassHash).
+func NewStaticNTLMAuthenticator(users map[string]*UserCredentials) *StaticNTLMAuthenticator {
+	return &StaticNTLMAuthenticator{Users: users}
 }
 
-// Authenticate implements UserAuthenticator.
-func (a *StaticUserAuthenticator) Authenticate(handle uint32, username string) (*UserCredentials, error) {
+// Authenticate implements NTLMAuthenticator.
+func (a *StaticNTLMAuthenticator) Authenticate(handle uint32, username string) (*UserCredentials, error) {
 	if a.Users == nil {
 		return nil, nil
 	}
@@ -128,6 +137,7 @@ const (
 )
 
 // Global configuration flags for ksmbd startup.
+// These flags correspond to KSMBD_GLOBAL_FLAG_* in the kernel netlink interface.
 const (
 	// GlobalFlagSMB2Leases enables SMB2 lease support.
 	GlobalFlagSMB2Leases = 1 << 0
@@ -142,9 +152,6 @@ const (
 	// GlobalFlagSMB2EncryptionOff explicitly disables encryption.
 	// Use this to ensure no encryption is used (INSECURE).
 	GlobalFlagSMB2EncryptionOff = 1 << 3
-
-	// GlobalFlagDurableHandle enables durable file handles.
-	GlobalFlagDurableHandle = 1 << 4
 )
 
 // ServerConfig holds security and operational configuration for the SMB server.
@@ -361,20 +368,23 @@ func wrapHandlerError(area LogArea, err error, format string, args ...interface{
 // --- Sys: Primary Server Instance ---
 
 // SysOpt contains configuration options for starting an SMB server.
+// At least one of NTLMAuthenticator or KerberosAuthenticator must be provided.
 type SysOpt struct {
-	Config        ServerConfig
-	ShareProvider ShareProvider
-	Authenticator UserAuthenticator
-	Logger        *Logger
+	Config                ServerConfig
+	ShareProvider         ShareProvider
+	NTLMAuthenticator     NTLMAuthenticator     // For NTLMv2 password-based authentication
+	KerberosAuthenticator KerberosAuthenticator // For Kerberos/SPNEGO authentication
+	Logger                *Logger
 }
 
 // Sys is the primary SMB server instance.
 // It encapsulates all state for a single ksmbd server.
 type Sys struct {
-	config        ServerConfig
-	shareProvider ShareProvider
-	authenticator UserAuthenticator
-	logger        *Logger
+	config                ServerConfig
+	shareProvider         ShareProvider
+	ntlmAuthenticator     NTLMAuthenticator
+	kerberosAuthenticator KerberosAuthenticator
+	logger                *Logger
 
 	// Internal state
 	rpcResponses map[uint32][]byte
@@ -727,6 +737,22 @@ type ksmbdTreeDisconnectRequest struct {
 	Reserved  [16]uint32
 }
 
+// ksmbdSpnegoAuthenRequest is a Kerberos/SPNEGO authentication request from kernel.
+type ksmbdSpnegoAuthenRequest struct {
+	Handle        uint32
+	SpnegoBlobLen uint16
+	// SpnegoBlob follows (variable length)
+}
+
+// ksmbdSpnegoAuthenResponse is a Kerberos/SPNEGO authentication response to kernel.
+type ksmbdSpnegoAuthenResponse struct {
+	Handle        uint32
+	LoginResponse ksmbdLoginResponse
+	SessionKeyLen uint16
+	SpnegoBlobLen uint16
+	// Payload follows: session_key + spnego_blob
+}
+
 // loadModule loads the ksmbd kernel module using syscalls.
 // It first tries FinitModule (syscall), then falls back to modprobe for dependency handling.
 func loadModule(name string) error {
@@ -783,10 +809,16 @@ func (s *Sys) Start(ctx context.Context, opt SysOpt) error {
 		return fmt.Errorf("must run as root")
 	}
 
+	// Validate that at least one authenticator is provided
+	if opt.NTLMAuthenticator == nil && opt.KerberosAuthenticator == nil {
+		return fmt.Errorf("at least one of NTLMAuthenticator or KerberosAuthenticator must be provided")
+	}
+
 	// Apply configuration from options
 	s.config = opt.Config
 	s.shareProvider = opt.ShareProvider
-	s.authenticator = opt.Authenticator
+	s.ntlmAuthenticator = opt.NTLMAuthenticator
+	s.kerberosAuthenticator = opt.KerberosAuthenticator
 	s.logger = opt.Logger
 	if s.logger == nil {
 		s.logger = NewLogger(nil) // disabled logger
@@ -944,6 +976,8 @@ func (s *Sys) handleKsmbdEvent(seq uint32, data []byte) error {
 		return s.handleTreeConnect(seq, payload)
 	case ksmbdEventTreeDisconnectReq:
 		return s.handleTreeDisconnect(seq, payload)
+	case ksmbdEventSpnegoAuthenRequest:
+		return s.handleSpnegoAuthen(seq, payload)
 	default:
 		s.logger.Debugf(LogAreaNetlink, "Received unhandled event cmd: %d", cmd)
 		return nil
@@ -1013,8 +1047,8 @@ func (s *Sys) handleLogin(seq uint32, payload []byte) error {
 
 	// Authenticate user via the configured authenticator
 	var creds *UserCredentials
-	if s.authenticator != nil {
-		creds, err = s.authenticator.Authenticate(req.Handle, user)
+	if s.ntlmAuthenticator != nil {
+		creds, err = s.ntlmAuthenticator.Authenticate(req.Handle, user)
 		if err != nil {
 			return wrapHandlerError(LogAreaAuth, err, "authentication error for user '%s'", user)
 		}
@@ -1452,6 +1486,124 @@ func (s *Sys) handleTreeDisconnect(seq uint32, payload []byte) error {
 	return nil
 }
 
+func (s *Sys) handleSpnegoAuthen(seq uint32, payload []byte) error {
+	attrs, err := getAttributes(payload)
+	if err != nil {
+		return wrapHandlerError(LogAreaAuth, err, "failed to parse SPNEGO attributes")
+	}
+	data, ok := attrs[ksmbdEventSpnegoAuthenRequest]
+	if !ok {
+		return newHandlerError(LogAreaAuth, "SPNEGO request: missing attribute %d", ksmbdEventSpnegoAuthenRequest)
+	}
+
+	// Read fixed header (handle + blob_len)
+	if len(data) < 6 {
+		return newHandlerError(LogAreaAuth, "SPNEGO request too short: %d bytes", len(data))
+	}
+	handle := binary.LittleEndian.Uint32(data[0:4])
+	blobLen := binary.LittleEndian.Uint16(data[4:6])
+	s.logger.Debugf(LogAreaAuth, "SPNEGO request (Handle: %d, BlobLen: %d)", handle, blobLen)
+
+	if len(data) < 6+int(blobLen) {
+		return newHandlerError(LogAreaAuth, "SPNEGO blob truncated: have %d, need %d", len(data)-6, blobLen)
+	}
+	spnegoBlob := data[6 : 6+blobLen]
+
+	// Check if Kerberos authenticator is configured
+	if s.kerberosAuthenticator == nil {
+		s.logger.Printf(LogAreaAuth, "SPNEGO request rejected: no Kerberos authenticator configured")
+		s.sendSpnegoFailure(seq, handle)
+		return nil
+	}
+
+	// Decode SPNEGO negTokenInit
+	mechOID, apReq, err := decodeNegTokenInit(spnegoBlob)
+	if err != nil {
+		s.logger.Printf(LogAreaAuth, "SPNEGO decode error: %v", err)
+		s.sendSpnegoFailure(seq, handle)
+		return nil
+	}
+	s.logger.Debugf(LogAreaAuth, "SPNEGO mechanism: %v, AP-REQ len: %d", mechOID, len(apReq))
+
+	// Validate Kerberos AP-REQ
+	authResult, err := s.kerberosAuthenticator.ValidateAPReq(apReq)
+	if err != nil {
+		s.logger.Printf(LogAreaAuth, "Kerberos validation failed: %v", err)
+		s.sendSpnegoFailure(seq, handle)
+		return nil
+	}
+	s.logger.Printf(LogAreaAuth, "Kerberos authenticated user: %s", authResult.Username)
+
+	// Build SPNEGO response token
+	respBlob, err := encodeNegTokenResp(spnegoAcceptCompleted, mechOID, authResult.APRep)
+	if err != nil {
+		s.logger.Printf(LogAreaAuth, "Failed to encode SPNEGO response: %v", err)
+		s.sendSpnegoFailure(seq, handle)
+		return nil
+	}
+
+	// Look up user credentials (for UID/GID)
+	var loginResp ksmbdLoginResponse
+	loginResp.Handle = handle
+	loginResp.Status = 9 // KSMBD_USER_FLAG_OK | KSMBD_USER_FLAG_KSMBD_USER
+	copyInt8(loginResp.Account[:], authResult.Username)
+
+	if s.ntlmAuthenticator != nil {
+		creds, err := s.ntlmAuthenticator.Authenticate(handle, authResult.Username)
+		if err == nil && creds != nil {
+			loginResp.Uid = creds.UID
+			loginResp.Gid = creds.GID
+		}
+	}
+
+	// Track login for share config correlation
+	s.pendingLogin.Lock()
+	s.pendingLogin.handle = handle
+	s.pendingLogin.username = authResult.Username
+	s.pendingLogin.Unlock()
+
+	// Notify share provider
+	if s.shareProvider != nil {
+		if err := s.shareProvider.OnLogin(handle, authResult.Username); err != nil {
+			s.logger.Printf(LogAreaAuth, "Share provider OnLogin error: %v", err)
+		}
+	}
+
+	// Build response
+	sessionKeyLen := uint16(len(authResult.SessionKey))
+	spnegoBlobLen := uint16(len(respBlob))
+
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.LittleEndian, handle)
+	binary.Write(buf, binary.LittleEndian, loginResp)
+	binary.Write(buf, binary.LittleEndian, sessionKeyLen)
+	binary.Write(buf, binary.LittleEndian, spnegoBlobLen)
+	buf.Write(authResult.SessionKey)
+	buf.Write(respBlob)
+
+	s.logger.Debugf(LogAreaAuth, "SPNEGO response: SessionKeyLen=%d, SpnegoBlobLen=%d, Total=%d",
+		sessionKeyLen, spnegoBlobLen, buf.Len())
+
+	attrBytes := makeAttribute(ksmbdEventSpnegoAuthenResponse, buf.Bytes())
+	s.sendResponse(seq, 0, ksmbdEventSpnegoAuthenResponse, attrBytes)
+	return nil
+}
+
+func (s *Sys) sendSpnegoFailure(seq uint32, handle uint32) {
+	var loginResp ksmbdLoginResponse
+	loginResp.Handle = handle
+	loginResp.Status = 0 // KSMBD_USER_FLAG_INVALID
+
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.LittleEndian, handle)
+	binary.Write(buf, binary.LittleEndian, loginResp)
+	binary.Write(buf, binary.LittleEndian, uint16(0)) // sessionKeyLen
+	binary.Write(buf, binary.LittleEndian, uint16(0)) // spnegoBlobLen
+
+	attrBytes := makeAttribute(ksmbdEventSpnegoAuthenResponse, buf.Bytes())
+	s.sendResponse(seq, 0, ksmbdEventSpnegoAuthenResponse, attrBytes)
+}
+
 func (s *Sys) sendStartup() error {
 	cfg := s.config
 
@@ -1461,6 +1613,19 @@ func (s *Sys) sendStartup() error {
 		flags |= GlobalFlagSMB2Encryption
 	} else {
 		flags |= GlobalFlagSMB2EncryptionOff
+	}
+
+	// Log Kerberos configuration if enabled.
+	// Note: The ksmbd kernel module handles SPNEGO negotiation internally and builds
+	// its own mechlist. We can't control what mechanisms the kernel advertises.
+	// However, when a client sends a Kerberos SPNEGO token, the kernel forwards
+	// it to userspace via KSMBD_EVENT_SPNEGO_AUTHEN_REQUEST, which we handle.
+	if s.kerberosAuthenticator != nil {
+		spnegoCfg := s.kerberosAuthenticator.SPNEGOConfig()
+		if spnegoCfg != nil {
+			s.logger.Printf(LogAreaAuth, "Kerberos authenticator configured: principal=%s@%s",
+				spnegoCfg.ServicePrincipal, spnegoCfg.Realm)
+		}
 	}
 
 	// Determine TCP port - use config or default for tests

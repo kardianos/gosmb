@@ -4,6 +4,14 @@ A Go userspace daemon for the Linux kernel's ksmbd SMB server. This library prov
 
 - **smbsys**: Core SMB server daemon that communicates with the ksmbd kernel module via netlink
 - **smbvfs**: A FUSE-based virtual filesystem backend for serving per-user virtual files over SMB
+- **krb5**: Pure Go Kerberos KDC and service authenticator for testing and development
+
+## Features
+
+- **Dual Authentication**: Support for both NTLMv2 (password) and Kerberos/SPNEGO authentication
+- **Per-User Virtual Filesystems**: FUSE backend enables dynamic, per-user file views
+- **Modern SMB Protocols**: SMB 3.0/3.1.1 with signing and encryption support
+- **Pure Go**: No CGO dependencies
 
 ## Requirements
 
@@ -46,7 +54,8 @@ func main() {
 		ShareProvider: smbsys.NewFSShareProvider([]smbsys.FSShare{
 			{ShareInfo: smbsys.ShareInfo{Name: "documents"}, Path: "/srv/samba/documents"},
 		}),
-		Authenticator: smbsys.NewStaticUserAuthenticator(map[string]*smbsys.UserCredentials{
+		// NTLMv2 password authentication
+		NTLMAuthenticator: smbsys.NewStaticNTLMAuthenticator(map[string]*smbsys.UserCredentials{
 			"alice": {PasswordHash: smbsys.NewPassHash("alice-password")},
 		}),
 	})
@@ -101,7 +110,7 @@ func main() {
 		Logger:        smbsys.NewLogger(os.Stderr),
 		Config:        smbsys.DefaultServerConfig(),
 		ShareProvider: backend,
-		Authenticator: smbsys.NewStaticUserAuthenticator(map[string]*smbsys.UserCredentials{
+		NTLMAuthenticator: smbsys.NewStaticNTLMAuthenticator(map[string]*smbsys.UserCredentials{
 			"alice": {PasswordHash: smbsys.NewPassHash("alice-pass")},
 			"bob":   {PasswordHash: smbsys.NewPassHash("bob-pass")},
 		}),
@@ -110,6 +119,81 @@ func main() {
 		os.Exit(1)
 	}
 	sys.Wait()
+}
+```
+
+## Authentication
+
+At least one authenticator must be configured. You can use NTLM, Kerberos, or both.
+
+### NTLMv2 Authentication (Password-based)
+
+```go
+// Static user list with NTLM hashes
+sys.Start(ctx, smbsys.SysOpt{
+	NTLMAuthenticator: smbsys.NewStaticNTLMAuthenticator(map[string]*smbsys.UserCredentials{
+		"alice": {PasswordHash: smbsys.NewPassHash("alice-password"), UID: 1000, GID: 1000},
+		"bob":   {PasswordHash: smbsys.NewPassHash("bob-password"), UID: 1001, GID: 1001},
+	}),
+	// ...
+})
+```
+
+### Kerberos/SPNEGO Authentication
+
+```go
+import "github.com/kardianos/gosmb/krb5"
+
+// Create service authenticator
+serviceAuth, err := krb5.NewServiceAuthenticator(krb5.ServiceAuthenticatorConfig{
+	Principal: "cifs/server.example.com",
+	Realm:     "EXAMPLE.COM",
+	Password:  "service-key-secret",  // Or use Keytab field
+})
+
+sys.Start(ctx, smbsys.SysOpt{
+	KerberosAuthenticator: serviceAuth,
+	// ...
+})
+```
+
+### Both Authentication Methods
+
+For maximum compatibility, configure both authenticators. Clients will use Kerberos when available and fall back to NTLM:
+
+```go
+sys.Start(ctx, smbsys.SysOpt{
+	KerberosAuthenticator: serviceAuth,
+	NTLMAuthenticator: smbsys.NewStaticNTLMAuthenticator(map[string]*smbsys.UserCredentials{
+		"alice": {PasswordHash: smbsys.NewPassHash("alice-password")},
+	}),
+	// ...
+})
+```
+
+### Custom NTLMAuthenticator
+
+Implement `NTLMAuthenticator` for database lookups, LDAP, etc:
+
+```go
+type DatabaseAuthenticator struct {
+	db *sql.DB
+}
+
+func (a *DatabaseAuthenticator) Authenticate(handle uint32, username string) (*smbsys.UserCredentials, error) {
+	// Look up user in database
+	user, err := a.db.FindUser(username)
+	if err != nil {
+		return nil, err
+	}
+	if user == nil {
+		return nil, nil // User not found
+	}
+	return &smbsys.UserCredentials{
+		PasswordHash: user.NTLMHash, // Pre-computed MD4(UTF16LE(password))
+		UID:          user.UID,
+		GID:          user.GID,
+	}, nil
 }
 ```
 
@@ -324,7 +408,7 @@ go test -c -o test-smbvfs ./smbvfs && sudo ./test-smbvfs; rm test-smbvfs
 
 ### Session Flow
 
-1. **LOGIN_REQUEST**: User authenticates via `UserAuthenticator`
+1. **LOGIN_REQUEST**: User authenticates via `NTLMAuthenticator` or `KerberosAuthenticator`
 2. **SHARE_CONFIG_REQUEST**: ksmbd requests share path via `ShareProvider.PathForSession()`
 3. **TREE_CONNECT_REQUEST**: User connects to share, `ShareProvider.OnTreeConnect()` called
 4. File operations go through FUSE → FSHandler with `Session` context
