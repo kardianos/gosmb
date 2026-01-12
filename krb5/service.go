@@ -226,7 +226,15 @@ type KerberosAuthResult = ServiceAuthResult
 //	    // ... other options
 //	})
 type SMBKerberosAuthenticator struct {
-	service *ServiceAuthenticator
+	service   *ServiceAuthenticator
+	principal string
+	realm     string
+}
+
+// SMBSPNEGOConfig contains SPNEGO configuration for SMB servers.
+type SMBSPNEGOConfig struct {
+	ServicePrincipal string
+	Realm            string
 }
 
 // SMBKerberosAuthResult matches the smbsys.KerberosAuthResult interface.
@@ -243,7 +251,11 @@ func NewSMBKerberosAuthenticator(cfg ServiceAuthenticatorConfig) (*SMBKerberosAu
 	if err != nil {
 		return nil, err
 	}
-	return &SMBKerberosAuthenticator{service: svc}, nil
+	return &SMBKerberosAuthenticator{
+		service:   svc,
+		principal: cfg.Principal,
+		realm:     cfg.Realm,
+	}, nil
 }
 
 // ValidateAPReq implements the smbsys.KerberosAuthenticator interface.
@@ -259,4 +271,12 @@ func (a *SMBKerberosAuthenticator) ValidateAPReq(apReqBytes []byte) (*SMBKerbero
 		SessionKey: result.SessionKey.KeyValue,
 		APRep:      result.APRep,
 	}, nil
+}
+
+// SPNEGOConfig returns the SPNEGO configuration for this authenticator.
+func (a *SMBKerberosAuthenticator) SPNEGOConfig() *SMBSPNEGOConfig {
+	return &SMBSPNEGOConfig{
+		ServicePrincipal: a.principal,
+		Realm:            a.realm,
+	}
 }

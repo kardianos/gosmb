@@ -185,9 +185,9 @@ func TestKerberosConfigValidation(t *testing.T) {
 			wantErr: "Realm is required",
 		},
 		{
-			name:    "missing credentials",
+			name:    "missing password",
 			cfg:     KerberosConfig{ServicePrincipal: "cifs/server", Realm: "EXAMPLE.COM"},
-			wantErr: "either Password or KeytabBytes must be provided",
+			wantErr: "Password is required",
 		},
 	}
 

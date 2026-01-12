@@ -8,7 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/jcmturner/aescts/v2"
+	"github.com/kardianos/gosmb/krb5/internal/aescts"
 	"golang.org/x/crypto/pbkdf2"
 )
 
