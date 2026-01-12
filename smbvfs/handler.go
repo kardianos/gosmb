@@ -3,6 +3,8 @@ package smbvfs
 import (
 	"context"
 	"errors"
+
+	"github.com/kardianos/gosmb/smbsys"
 )
 
 // Common errors that FSHandler implementations should return.
@@ -48,19 +50,9 @@ const (
 	ModeTypeMask = 0170000 // S_IFMT
 )
 
-// Session identifies the user and share for a filesystem operation.
-// This is passed to all FSHandler methods to provide context about
-// who is accessing what.
-type Session struct {
-	// User is the authenticated username (e.g., "alice").
-	User string
-
-	// Share is the share name being accessed (e.g., "documents").
-	Share string
-
-	// Handle is the session handle from ksmbd.
-	Handle uint32
-}
+// Session is an alias for smbsys.Session for convenience.
+// It identifies the user and share for a filesystem operation.
+type Session = smbsys.Session
 
 // FSHandler is implemented by users to provide virtual filesystem logic.
 // All paths are relative to the share root (e.g., "subdir/file.txt").

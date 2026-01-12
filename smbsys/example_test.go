@@ -87,7 +87,7 @@ type DatabaseAuthenticator struct {
 }
 
 // Authenticate implements smbsys.UserAuthenticator.
-func (a *DatabaseAuthenticator) Authenticate(username string) (*smbsys.UserCredentials, error) {
+func (a *DatabaseAuthenticator) Authenticate(handle uint32, username string) (*smbsys.UserCredentials, error) {
 	// In practice, look up the user in a database:
 	// user, err := a.db.FindUser(username)
 	// if err != nil {
@@ -103,6 +103,7 @@ func (a *DatabaseAuthenticator) Authenticate(username string) (*smbsys.UserCrede
 	// }, nil
 
 	// Example: reject all users
+	_ = handle // Available for session correlation if needed
 	return nil, nil
 }
 

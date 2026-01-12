@@ -140,25 +140,27 @@ func NewBackendWithOptions(mountPoint string, handler FSHandler, opts BackendOpt
 }
 
 // GetShare implements ShareProvider.
-func (b *Backend) GetShare(name string) *smbsys.ShareInfo {
-	if strings.EqualFold(name, b.shareName) {
+// Backend ignores user/handle since all logged-in users have access.
+func (b *Backend) GetShare(s smbsys.Session) *smbsys.ShareInfo {
+	if strings.EqualFold(s.Share, b.shareName) {
 		return &b.shareInfo
 	}
 	return nil
 }
 
 // ListShares implements ShareProvider.
-func (b *Backend) ListShares() []smbsys.ShareInfo {
+// Backend returns the single VFS share regardless of handle.
+func (b *Backend) ListShares(handle uint32) []smbsys.ShareInfo {
 	return []smbsys.ShareInfo{b.shareInfo}
 }
 
 // PathForSession returns the session-specific path for ksmbd.
 // This encodes the session handle in the path so FUSE can route to the right user.
-func (b *Backend) PathForSession(share string, handle uint32) string {
-	if !strings.EqualFold(share, b.shareName) {
+func (b *Backend) PathForSession(s smbsys.Session) string {
+	if !strings.EqualFold(s.Share, b.shareName) {
 		return ""
 	}
-	return fmt.Sprintf("%s/.s/%d", b.mountPoint, handle)
+	return fmt.Sprintf("%s/.s/%d", b.mountPoint, s.Handle)
 }
 
 // OnLogin is called when a user logs in.
@@ -181,16 +183,16 @@ func (b *Backend) OnLogout(handle uint32) error {
 }
 
 // OnTreeConnect is called when a user connects to the share.
-func (b *Backend) OnTreeConnect(ctx smbsys.TreeConnectContext) error {
+func (b *Backend) OnTreeConnect(s smbsys.Session, t smbsys.TreeContext) error {
 	// Session already tracked from login; nothing additional needed
-	log.Printf("VFS: Tree connect for user %s (handle: %d, session: %d)",
-		ctx.Username, ctx.Handle, ctx.SessionID)
+	log.Printf("VFS: Tree connect for user %s on share %s (handle: %d, session: %d)",
+		s.User, s.Share, s.Handle, t.SessionID)
 	return nil
 }
 
 // OnTreeDisconnect is called when a user disconnects from the share.
-func (b *Backend) OnTreeDisconnect(sessionID, connID uint64) error {
-	log.Printf("VFS: Tree disconnect (session: %d, conn: %d)", sessionID, connID)
+func (b *Backend) OnTreeDisconnect(t smbsys.TreeContext) error {
+	log.Printf("VFS: Tree disconnect (session: %d, conn: %d)", t.SessionID, t.ConnectionID)
 	return nil
 }
 

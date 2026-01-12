@@ -155,7 +155,7 @@ cfg := smbsys.ServerConfig{
 
 ### Share Configuration
 
-Shares are configured via the `ShareProvider` interface. Use `FSShareProvider` for filesystem-backed shares:
+Shares are configured via the `ShareProvider` interface. The `GetShare` method receives a `Session` containing the share name and user context for per-user access control. Use `FSShareProvider` for filesystem-backed shares:
 
 ```go
 shares := smbsys.NewFSShareProvider([]smbsys.FSShare{
@@ -197,14 +197,20 @@ type FSHandler interface {
 	Truncate(ctx context.Context, s Session, path string, size uint64) error
 	SetAttr(ctx context.Context, s Session, path string, attr *Attr) error
 }
+```
 
-// Session identifies the user and share for a filesystem operation
+The `Session` type is defined in `smbsys` and aliased in `smbvfs` for convenience:
+
+```go
+// smbsys.Session identifies the user and share for an operation
 type Session struct {
-	User   string // Authenticated username
+	User   string // Authenticated username (may be empty if lookup needed)
 	Share  string // Share name being accessed
 	Handle uint32 // ksmbd session handle
 }
 ```
+
+Session is used consistently across the ShareProvider and FSHandler interfaces.
 
 ### Custom Errors
 
@@ -271,14 +277,22 @@ Uses the host kernel's ksmbd module in a privileged container:
 
 ```bash
 # Run tests
-docker-compose run --rm test
+./test-docker.sh
 
-# Or use the helper script
-./test-docker.sh test
+# Run with verbose output
+./test-docker.sh -v
+
+# Run with race detector
+./test-docker.sh -race
+
+# Combined flags
+./test-docker.sh -v -race
 
 # Interactive shell
 ./test-docker.sh shell
 ```
+
+The container image is built once and cached (tagged by Dockerfile hash). Go module and build caches are persisted in Docker volumes (`gosmb-modcache`, `gosmb-buildcache`).
 
 ### Local (Requires ksmbd on host)
 

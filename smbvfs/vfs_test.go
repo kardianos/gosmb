@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/kardianos/gosmb/smbsys"
 )
 
 func TestVFSBackend(t *testing.T) {
@@ -51,8 +53,8 @@ func TestVFSBackend(t *testing.T) {
 	}
 
 	t.Run("PathForSession", func(t *testing.T) {
-		alicePath := backend.PathForSession("vfs", 42)
-		bobPath := backend.PathForSession("vfs", 43)
+		alicePath := backend.PathForSession(smbsys.Session{Share: "vfs", Handle: 42})
+		bobPath := backend.PathForSession(smbsys.Session{Share: "vfs", Handle: 43})
 
 		if alicePath == bobPath {
 			t.Error("Alice and Bob should have different paths")
@@ -66,7 +68,7 @@ func TestVFSBackend(t *testing.T) {
 	})
 
 	t.Run("ReadAliceFile", func(t *testing.T) {
-		alicePath := backend.PathForSession("vfs", 42)
+		alicePath := backend.PathForSession(smbsys.Session{Share: "vfs", Handle: 42})
 		content, err := os.ReadFile(filepath.Join(alicePath, "hello.txt"))
 		if err != nil {
 			t.Fatalf("Failed to read alice's hello.txt: %v", err)
@@ -77,7 +79,7 @@ func TestVFSBackend(t *testing.T) {
 	})
 
 	t.Run("ReadBobFile", func(t *testing.T) {
-		bobPath := backend.PathForSession("vfs", 43)
+		bobPath := backend.PathForSession(smbsys.Session{Share: "vfs", Handle: 43})
 		content, err := os.ReadFile(filepath.Join(bobPath, "hello.txt"))
 		if err != nil {
 			t.Fatalf("Failed to read bob's hello.txt: %v", err)
@@ -88,8 +90,8 @@ func TestVFSBackend(t *testing.T) {
 	})
 
 	t.Run("UserIsolation", func(t *testing.T) {
-		alicePath := backend.PathForSession("vfs", 42)
-		bobPath := backend.PathForSession("vfs", 43)
+		alicePath := backend.PathForSession(smbsys.Session{Share: "vfs", Handle: 42})
+		bobPath := backend.PathForSession(smbsys.Session{Share: "vfs", Handle: 43})
 
 		// Alice should have secret.txt
 		if _, err := os.Stat(filepath.Join(alicePath, "secret.txt")); err != nil {
@@ -113,7 +115,7 @@ func TestVFSBackend(t *testing.T) {
 	})
 
 	t.Run("ReadNestedFile", func(t *testing.T) {
-		alicePath := backend.PathForSession("vfs", 42)
+		alicePath := backend.PathForSession(smbsys.Session{Share: "vfs", Handle: 42})
 		content, err := os.ReadFile(filepath.Join(alicePath, "docs", "readme.md"))
 		if err != nil {
 			t.Fatalf("Failed to read nested file: %v", err)
@@ -124,7 +126,7 @@ func TestVFSBackend(t *testing.T) {
 	})
 
 	t.Run("ListDirectory", func(t *testing.T) {
-		alicePath := backend.PathForSession("vfs", 42)
+		alicePath := backend.PathForSession(smbsys.Session{Share: "vfs", Handle: 42})
 		entries, err := os.ReadDir(alicePath)
 		if err != nil {
 			t.Fatalf("Failed to list directory: %v", err)
@@ -144,7 +146,7 @@ func TestVFSBackend(t *testing.T) {
 	})
 
 	t.Run("WriteFile", func(t *testing.T) {
-		alicePath := backend.PathForSession("vfs", 42)
+		alicePath := backend.PathForSession(smbsys.Session{Share: "vfs", Handle: 42})
 		testFile := filepath.Join(alicePath, "hello.txt")
 
 		// Write new content
@@ -164,7 +166,7 @@ func TestVFSBackend(t *testing.T) {
 	})
 
 	t.Run("CreateFile", func(t *testing.T) {
-		alicePath := backend.PathForSession("vfs", 42)
+		alicePath := backend.PathForSession(smbsys.Session{Share: "vfs", Handle: 42})
 		testFile := filepath.Join(alicePath, "newfile.txt")
 
 		content := []byte("Brand new file!\n")
@@ -183,7 +185,7 @@ func TestVFSBackend(t *testing.T) {
 	})
 
 	t.Run("CreateDirectory", func(t *testing.T) {
-		alicePath := backend.PathForSession("vfs", 42)
+		alicePath := backend.PathForSession(smbsys.Session{Share: "vfs", Handle: 42})
 		testDir := filepath.Join(alicePath, "newdir")
 
 		if err := os.Mkdir(testDir, 0755); err != nil {
@@ -201,7 +203,7 @@ func TestVFSBackend(t *testing.T) {
 	})
 
 	t.Run("RemoveFile", func(t *testing.T) {
-		alicePath := backend.PathForSession("vfs", 42)
+		alicePath := backend.PathForSession(smbsys.Session{Share: "vfs", Handle: 42})
 
 		// Create a file to remove
 		testFile := filepath.Join(alicePath, "todelete.txt")
@@ -221,7 +223,7 @@ func TestVFSBackend(t *testing.T) {
 	})
 
 	t.Run("Rename", func(t *testing.T) {
-		alicePath := backend.PathForSession("vfs", 42)
+		alicePath := backend.PathForSession(smbsys.Session{Share: "vfs", Handle: 42})
 
 		// Create a file to rename
 		oldPath := filepath.Join(alicePath, "oldname.txt")

@@ -20,6 +20,19 @@ const (
 	NoForceGID = 0xFFFF
 )
 
+// Session identifies the user and share for an operation.
+// This is passed to ShareProvider methods and FSHandler methods.
+type Session struct {
+	// User is the authenticated username.
+	User string
+
+	// Share is the share name being accessed.
+	Share string
+
+	// Handle is the ksmbd session handle.
+	Handle uint32
+}
+
 // ShareProvider provides share configuration and filesystem backing.
 // This interface combines share enumeration with the filesystem backend,
 // since the backend is responsible for knowing where shares are stored.
@@ -27,19 +40,21 @@ const (
 // Note: The IPC$ share is handled internally by the server and should not
 // be included in your ShareProvider implementation.
 type ShareProvider interface {
-	// GetShare returns the share info if it exists, or nil if not.
-	GetShare(name string) *ShareInfo
+	// GetShare returns the share info for the share in s.Share.
+	// Return nil to deny access (share doesn't exist or user not authorized).
+	// The session provides context for per-user access control.
+	GetShare(s Session) *ShareInfo
 
-	// ListShares returns shares for enumeration (NetShareEnumAll).
+	// ListShares returns shares visible to the given handle.
 	// Hidden shares (Hidden=true) are automatically filtered from results.
-	// Return an empty slice to hide all shares from enumeration while still
-	// allowing access via GetShare.
-	ListShares() []ShareInfo
+	// Use handle to look up the username from OnLogin if needed.
+	// Return an empty slice to hide all shares from enumeration.
+	ListShares(handle uint32) []ShareInfo
 
-	// PathForSession returns the filesystem path for a session accessing a share.
-	// For real filesystems, this returns the configured path for the share.
-	// For FUSE backends, this may return a session-specific path like "/.s/{handle}/share".
-	PathForSession(share string, handle uint32) string
+	// PathForSession returns the filesystem path for the session.
+	// For real filesystems, this returns the configured path for s.Share.
+	// For FUSE backends, this may return a session-specific path like "/.s/{handle}".
+	PathForSession(s Session) string
 
 	// OnLogin is called when a user authenticates.
 	// The backend can use this to set up session-specific state.
@@ -49,10 +64,11 @@ type ShareProvider interface {
 	OnLogout(handle uint32) error
 
 	// OnTreeConnect is called when a user connects to a share.
-	OnTreeConnect(ctx TreeConnectContext) error
+	OnTreeConnect(s Session, t TreeContext) error
 
 	// OnTreeDisconnect is called when user disconnects from a share.
-	OnTreeDisconnect(sessionID, connID uint64) error
+	// Session info is not provided by kernel; look up from OnTreeConnect if needed.
+	OnTreeDisconnect(t TreeContext) error
 
 	// Close cleans up resources (unmount FUSE, etc.).
 	Close() error
@@ -91,43 +107,8 @@ type ShareInfo struct {
 	ForceGID uint16
 }
 
-// EffectiveCreateMask returns CreateMask or DefaultCreateMask if zero.
-func (s *ShareInfo) EffectiveCreateMask() uint16 {
-	if s.CreateMask == 0 {
-		return DefaultCreateMask
-	}
-	return s.CreateMask
-}
-
-// EffectiveDirectoryMask returns DirectoryMask or DefaultDirectoryMask if zero.
-func (s *ShareInfo) EffectiveDirectoryMask() uint16 {
-	if s.DirectoryMask == 0 {
-		return DefaultDirectoryMask
-	}
-	return s.DirectoryMask
-}
-
-// EffectiveForceUID returns ForceUID or NoForceUID if zero.
-func (s *ShareInfo) EffectiveForceUID() uint16 {
-	if s.ForceUID == 0 {
-		return NoForceUID
-	}
-	return s.ForceUID
-}
-
-// EffectiveForceGID returns ForceGID or NoForceGID if zero.
-func (s *ShareInfo) EffectiveForceGID() uint16 {
-	if s.ForceGID == 0 {
-		return NoForceGID
-	}
-	return s.ForceGID
-}
-
-// TreeConnectContext contains information about a tree connect event.
-type TreeConnectContext struct {
-	Handle       uint32
-	Username     string
-	ShareName    string
+// TreeContext identifies an SMB tree connection.
+type TreeContext struct {
 	SessionID    uint64
 	ConnectionID uint64
 }
@@ -156,26 +137,28 @@ func NewFSShareProvider(shares []FSShare) *FSShareProvider {
 }
 
 // GetShare implements ShareProvider.
-func (p *FSShareProvider) GetShare(name string) *ShareInfo {
-	if s, ok := p.shares[strings.ToLower(name)]; ok {
-		return &s.ShareInfo
+// FSShareProvider ignores user/handle since all users have access to all shares.
+func (p *FSShareProvider) GetShare(s Session) *ShareInfo {
+	if share, ok := p.shares[strings.ToLower(s.Share)]; ok {
+		return &share.ShareInfo
 	}
 	return nil
 }
 
 // ListShares implements ShareProvider.
-func (p *FSShareProvider) ListShares() []ShareInfo {
+// FSShareProvider returns all shares regardless of handle.
+func (p *FSShareProvider) ListShares(handle uint32) []ShareInfo {
 	result := make([]ShareInfo, 0, len(p.shares))
-	for _, s := range p.shares {
-		result = append(result, s.ShareInfo)
+	for _, share := range p.shares {
+		result = append(result, share.ShareInfo)
 	}
 	return result
 }
 
 // PathForSession implements ShareProvider.
-func (p *FSShareProvider) PathForSession(share string, handle uint32) string {
-	if s, ok := p.shares[strings.ToLower(share)]; ok {
-		return s.Path
+func (p *FSShareProvider) PathForSession(s Session) string {
+	if share, ok := p.shares[strings.ToLower(s.Share)]; ok {
+		return share.Path
 	}
 	return ""
 }
@@ -191,12 +174,12 @@ func (p *FSShareProvider) OnLogout(handle uint32) error {
 }
 
 // OnTreeConnect implements ShareProvider.
-func (p *FSShareProvider) OnTreeConnect(ctx TreeConnectContext) error {
+func (p *FSShareProvider) OnTreeConnect(s Session, t TreeContext) error {
 	return nil
 }
 
 // OnTreeDisconnect implements ShareProvider.
-func (p *FSShareProvider) OnTreeDisconnect(sessionID, connID uint64) error {
+func (p *FSShareProvider) OnTreeDisconnect(t TreeContext) error {
 	return nil
 }
 

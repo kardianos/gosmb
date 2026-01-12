@@ -78,7 +78,10 @@ type UserAuthenticator interface {
 	// Return credentials, nil if the user exists.
 	// Return nil, nil if the user doesn't exist (login will be rejected).
 	// Return nil, error if there was an error during authentication.
-	Authenticate(username string) (*UserCredentials, error)
+	//
+	// Note: PasswordHash must be the NTLM hash (MD4 of UTF-16LE password) because
+	// the kernel uses it to verify the client's NTLM challenge-response.
+	Authenticate(handle uint32, username string) (*UserCredentials, error)
 }
 
 // StaticUserAuthenticator is a simple authenticator that uses a static user list.
@@ -92,7 +95,7 @@ func NewStaticUserAuthenticator(users map[string]*UserCredentials) *StaticUserAu
 }
 
 // Authenticate implements UserAuthenticator.
-func (a *StaticUserAuthenticator) Authenticate(username string) (*UserCredentials, error) {
+func (a *StaticUserAuthenticator) Authenticate(handle uint32, username string) (*UserCredentials, error) {
 	if a.Users == nil {
 		return nil, nil
 	}
@@ -641,6 +644,47 @@ type ksmbdShareConfigResponse struct {
 	// Payload follows (Veto list + Share Path)
 }
 
+// toConfigResponse builds a ksmbdShareConfigResponse from ShareInfo.
+func (s *ShareInfo) toConfigResponse(handle uint32, shareName [ksmbdReqMaxShareName]int8) ksmbdShareConfigResponse {
+	flags := uint32(ksmbdShareFlagAvailable | ksmbdShareFlagStoreDosAttrs | ksmbdShareFlagOplocks)
+	if !s.Hidden {
+		flags |= ksmbdShareFlagBrowseable
+	}
+	if !s.ReadOnly {
+		flags |= ksmbdShareFlagWriteable
+	}
+
+	createMask := s.CreateMask
+	if createMask == 0 {
+		createMask = DefaultCreateMask
+	}
+	directoryMask := s.DirectoryMask
+	if directoryMask == 0 {
+		directoryMask = DefaultDirectoryMask
+	}
+	forceUID := s.ForceUID
+	if forceUID == 0 {
+		forceUID = NoForceUID
+	}
+	forceGID := s.ForceGID
+	if forceGID == 0 {
+		forceGID = NoForceGID
+	}
+
+	resp := ksmbdShareConfigResponse{
+		Handle:             handle,
+		Flags:              flags,
+		CreateMask:         createMask,
+		DirectoryMask:      directoryMask,
+		ForceCreateMode:    s.ForceCreateMode,
+		ForceDirectoryMode: s.ForceDirectoryMode,
+		ForceUid:           forceUID,
+		ForceGid:           forceGID,
+	}
+	copy(resp.ShareName[:], shareName[:])
+	return resp
+}
+
 type ksmbdHeartbeat struct {
 	Handle uint32
 }
@@ -970,7 +1014,7 @@ func (s *Sys) handleLogin(seq uint32, payload []byte) error {
 	// Authenticate user via the configured authenticator
 	var creds *UserCredentials
 	if s.authenticator != nil {
-		creds, err = s.authenticator.Authenticate(user)
+		creds, err = s.authenticator.Authenticate(req.Handle, user)
 		if err != nil {
 			return wrapHandlerError(LogAreaAuth, err, "authentication error for user '%s'", user)
 		}
@@ -1039,40 +1083,28 @@ func (s *Sys) handleShareConfig(seq uint32, payload []byte) error {
 	if s.shareProvider == nil {
 		return newHandlerError(LogAreaShare, "no share provider configured")
 	}
-	shareInfo := s.shareProvider.GetShare(share)
-	if shareInfo == nil {
-		return newHandlerError(LogAreaShare, "share '%s' not found", share)
-	}
 
-	// Build response flags based on share configuration
-	flags := uint32(ksmbdShareFlagAvailable | ksmbdShareFlagStoreDosAttrs | ksmbdShareFlagOplocks)
-	if !shareInfo.Hidden {
-		flags |= ksmbdShareFlagBrowseable
-	}
-	if !shareInfo.ReadOnly {
-		flags |= ksmbdShareFlagWriteable
-	}
-
-	resp := ksmbdShareConfigResponse{
-		Handle:             req.Handle,
-		Flags:              flags,
-		CreateMask:         shareInfo.EffectiveCreateMask(),
-		DirectoryMask:      shareInfo.EffectiveDirectoryMask(),
-		ForceCreateMode:    shareInfo.ForceCreateMode,
-		ForceDirectoryMode: shareInfo.ForceDirectoryMode,
-		ForceUid:           shareInfo.EffectiveForceUID(),
-		ForceGid:           shareInfo.EffectiveForceGID(),
-	}
-	copy(resp.ShareName[:], req.ShareName[:])
-
-	// Get the session handle from pending login for session-specific path
+	// Get session context (handle from request, username from pending login)
 	s.pendingLogin.Lock()
-	handle := s.pendingLogin.handle
+	username := s.pendingLogin.username
 	s.pendingLogin.Unlock()
 
+	sess := Session{
+		Handle: req.Handle,
+		User:   username,
+		Share:  share,
+	}
+
+	shareInfo := s.shareProvider.GetShare(sess)
+	if shareInfo == nil {
+		return newHandlerError(LogAreaShare, "share '%s' not found or access denied for user '%s'", share, username)
+	}
+
+	resp := shareInfo.toConfigResponse(req.Handle, req.ShareName)
+
 	// Get path from share provider
-	path := s.shareProvider.PathForSession(share, handle)
-	s.logger.Debugf(LogAreaShare, "Share '%s' path: %s (handle: %d)", share, path, handle)
+	path := s.shareProvider.PathForSession(sess)
+	s.logger.Debugf(LogAreaShare, "Share '%s' path: %s (handle: %d, user: %s)", share, path, sess.Handle, sess.User)
 	s.logger.Debugf(LogAreaShare, "Share '%s': Hidden=%v, ReadOnly=%v, Flags=%x", share, shareInfo.Hidden, shareInfo.ReadOnly, resp.Flags)
 	pathBytes := append([]byte(path), 0) // Null terminated
 	resp.PayloadSz = uint32(len(pathBytes))
@@ -1207,7 +1239,7 @@ func (s *Sys) handleRpc(seq uint32, payload []byte) error {
 
 				// Add shares from provider (non-hidden only)
 				if s.shareProvider != nil {
-					for _, sh := range s.shareProvider.ListShares() {
+					for _, sh := range s.shareProvider.ListShares(req.Handle) {
 						if !sh.Hidden {
 							entries = append(entries, shareEntry{
 								Name:    sh.Name,
@@ -1360,14 +1392,16 @@ func (s *Sys) handleTreeConnect(seq uint32, payload []byte) error {
 
 	// Notify share provider about tree connect
 	if s.shareProvider != nil {
-		ctx := TreeConnectContext{
-			Handle:       req.Handle,
-			Username:     user,
-			ShareName:    share,
+		sess := Session{
+			Handle: req.Handle,
+			User:   user,
+			Share:  share,
+		}
+		tree := TreeContext{
 			SessionID:    req.SessionId,
 			ConnectionID: req.ConnectId,
 		}
-		if err := s.shareProvider.OnTreeConnect(ctx); err != nil {
+		if err := s.shareProvider.OnTreeConnect(sess, tree); err != nil {
 			return wrapHandlerError(LogAreaTree, err, "share provider OnTreeConnect error")
 		}
 	}
@@ -1404,7 +1438,11 @@ func (s *Sys) handleTreeDisconnect(seq uint32, payload []byte) error {
 
 	// Notify share provider about tree disconnect
 	if s.shareProvider != nil {
-		if err := s.shareProvider.OnTreeDisconnect(req.SessionId, req.ConnectId); err != nil {
+		tree := TreeContext{
+			SessionID:    req.SessionId,
+			ConnectionID: req.ConnectId,
+		}
+		if err := s.shareProvider.OnTreeDisconnect(tree); err != nil {
 			return wrapHandlerError(LogAreaTree, err, "share provider OnTreeDisconnect error")
 		}
 	}

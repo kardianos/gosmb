@@ -1,39 +1,53 @@
 #!/bin/sh
 # Run gosmb tests in privileged Alpine container
 # Uses host kernel modules (ksmbd must be available on host)
+#
+# Usage:
+#   ./test-docker.sh              # Run tests
+#   ./test-docker.sh -v           # Run tests with verbose output
+#   ./test-docker.sh -race        # Run tests with race detector
+#   ./test-docker.sh -v -race     # Combined flags
+#   ./test-docker.sh shell        # Open interactive shell
 
 set -e
 
 cd "$(dirname "$0")"
 
-# Detect docker compose command (v2 plugin vs v1 standalone)
-if docker compose version >/dev/null 2>&1; then
-    COMPOSE="docker compose"
-elif command -v docker-compose >/dev/null 2>&1; then
-    COMPOSE="docker-compose"
-else
-    echo "Error: docker compose not found"
-    echo "Install docker-compose or Docker Compose v2 plugin"
-    exit 1
+# Image name with hash suffix for cache invalidation
+IMAGE_BASE="gosmb-test"
+DOCKERFILE_HASH=$(sha256sum Dockerfile | cut -c1-8)
+IMAGE_NAME="${IMAGE_BASE}:${DOCKERFILE_HASH}"
+
+# Build image if it doesn't exist
+build_if_needed() {
+    if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+        echo "Building container image ${IMAGE_NAME}..."
+        docker build -t "$IMAGE_NAME" .
+    fi
+}
+
+# Run container with source and caches mounted
+run_container() {
+    docker run --rm \
+        --privileged \
+        --pid=host \
+        --network=host \
+        -v /lib/modules:/lib/modules:ro \
+        -v /tmp:/tmp \
+        -v "$(pwd)":/app \
+        -v gosmb-modcache:/go/pkg/mod \
+        -v gosmb-buildcache:/root/.cache/go-build \
+        "$@"
+}
+
+# Check for shell command
+if [ "$1" = "shell" ]; then
+    build_if_needed
+    echo "Opening shell in container..."
+    run_container -it "$IMAGE_NAME" /bin/sh
+    exit 0
 fi
 
-case "${1:-test}" in
-    test)
-        echo "Running tests in container..."
-        $COMPOSE build test
-        $COMPOSE run --rm test
-        ;;
-    shell)
-        echo "Opening shell in container..."
-        $COMPOSE build shell
-        $COMPOSE run --rm shell
-        ;;
-    build)
-        echo "Building container..."
-        $COMPOSE build
-        ;;
-    *)
-        echo "Usage: $0 [test|shell|build]"
-        exit 1
-        ;;
-esac
+# Default: run tests with any provided arguments
+build_if_needed
+run_container "$IMAGE_NAME" go test "$@" ./...
