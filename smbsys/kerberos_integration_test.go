@@ -3,7 +3,6 @@ package smbsys
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/kardianos/gosmb/krb5"
+	"github.com/kardianos/gosmb/smblog"
 )
 
 const (
@@ -60,16 +60,45 @@ func addHostsEntry(hostname string) (cleanup func(), err error) {
 	}, nil
 }
 
-// testKDCClientAuth provides client authentication for the test KDC.
-type testKDCClientAuth struct {
-	users map[string]string
+// testKDCPrincipalStore is a simple principal store for testing.
+// Stores pre-computed AES256 keys for both users and services.
+type testKDCPrincipalStore struct {
+	users    map[string][]byte // user principal -> key
+	services map[string][]byte // service principal -> key
 }
 
-func (a *testKDCClientAuth) Authenticate(principal, realm string) (string, error) {
-	if pw, ok := a.users[principal]; ok {
-		return pw, nil
+func (s *testKDCPrincipalStore) GetKey(principalType krb5.PrincipalType, principal, realm string) ([]byte, error) {
+	switch principalType {
+	case krb5.PrincipalUser:
+		if key, ok := s.users[principal]; ok {
+			return key, nil
+		}
+		return nil, fmt.Errorf("user not found: %s", principal)
+	case krb5.PrincipalService:
+		if key, ok := s.services[principal]; ok {
+			return key, nil
+		}
+		return nil, fmt.Errorf("service not found: %s", principal)
+	default:
+		return nil, fmt.Errorf("unknown principal type: %v", principalType)
 	}
-	return "", fmt.Errorf("user not found: %s", principal)
+}
+
+// newTestKDCPrincipalStore creates a test principal store with keys derived from passwords.
+func newTestKDCPrincipalStore(realm string, users, services map[string]string) *testKDCPrincipalStore {
+	store := &testKDCPrincipalStore{
+		users:    make(map[string][]byte),
+		services: make(map[string][]byte),
+	}
+	for principal, password := range users {
+		key, _ := krb5.DeriveKey(password, principal, realm)
+		store.users[principal] = key
+	}
+	for principal, password := range services {
+		key, _ := krb5.DeriveKey(password, principal, realm)
+		store.services[principal] = key
+	}
+	return store
 }
 
 // krb5AuthAdapter wraps krb5.ServiceAuthenticator to implement smbsys.KerberosAuthenticator.
@@ -273,16 +302,12 @@ func TestKerberosIntegrationWithKinit(t *testing.T) {
 	kdc, err := krb5.NewKDC(krb5.KDCConfig{
 		Realm:      kerbTestRealm,
 		ListenAddr: "0.0.0.0:88",
-		ClientAuth: &testKDCClientAuth{
-			users: map[string]string{
-				kerbTestUser: kerbTestPassword,
-			},
-		},
-		Services: map[string]string{
-			servicePrincipal: kerbServiceSecret,
-		},
+		Principals: newTestKDCPrincipalStore(kerbTestRealm,
+			map[string]string{kerbTestUser: kerbTestPassword},
+			map[string]string{servicePrincipal: kerbServiceSecret},
+		),
 		TicketLifetime: 1 * time.Hour,
-		Logger:         log.New(os.Stderr, "", log.LstdFlags),
+		Logger:         smblog.New(os.Stderr),
 	})
 	if err != nil {
 		t.Fatalf("NewKDC: %v", err)
@@ -395,13 +420,11 @@ func TestKerberosClientLibrary(t *testing.T) {
 	kdc, err := krb5.NewKDC(krb5.KDCConfig{
 		Realm:      realm,
 		ListenAddr: "127.0.0.1:88",
-		ClientAuth: &testKDCClientAuth{
-			users: map[string]string{user: password},
-		},
-		Services: map[string]string{
-			servicePrincipal: servicePassword,
-		},
-		Logger: log.New(os.Stderr, "", log.LstdFlags),
+		Principals: newTestKDCPrincipalStore(realm,
+			map[string]string{user: password},
+			map[string]string{servicePrincipal: servicePassword},
+		),
+		Logger: smblog.New(os.Stderr),
 	})
 	if err != nil {
 		t.Fatalf("NewKDC: %v", err)
@@ -544,16 +567,12 @@ func TestKerberosSMBClientIntegration(t *testing.T) {
 	kdc, err := krb5.NewKDC(krb5.KDCConfig{
 		Realm:      testRealm,
 		ListenAddr: "0.0.0.0:88",
-		ClientAuth: &testKDCClientAuth{
-			users: map[string]string{
-				testUser: testPassword,
-			},
-		},
-		Services: map[string]string{
-			servicePrincipal: servicePassword,
-		},
+		Principals: newTestKDCPrincipalStore(testRealm,
+			map[string]string{testUser: testPassword},
+			map[string]string{servicePrincipal: servicePassword},
+		),
 		TicketLifetime: 1 * time.Hour,
-		Logger:         log.New(os.Stderr, "[KDC] ", log.LstdFlags),
+		Logger:         smblog.New(os.Stderr),
 	})
 	if err != nil {
 		t.Fatalf("NewKDC: %v", err)

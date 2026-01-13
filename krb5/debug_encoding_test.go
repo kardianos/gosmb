@@ -19,7 +19,7 @@ func TestKeyDerivationRFC3962(t *testing.T) {
 	principal := "alice"
 	realm := "TEST.GOSMB.LOCAL"
 
-	key, err := DeriveKey(ETypeAES256SHA1, password, principal, realm)
+	key, err := deriveKeyFromPassword(eTypeAES256SHA1, password, principal, realm)
 	if err != nil {
 		t.Fatalf("DeriveKey failed: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestKeyDerivationWithKTUtil(t *testing.T) {
 	principal := "alice"
 	realm := "TEST.GOSMB.LOCAL"
 
-	key, _ := DeriveKey(ETypeAES256SHA1, password, principal, realm)
+	key, _ := deriveKeyFromPassword(eTypeAES256SHA1, password, principal, realm)
 	t.Logf("Our derived key: %x", key)
 	t.Logf("Key length: %d bytes", len(key))
 	t.Logf("Last 2 bytes (hex): %X", key[len(key)-2:])
@@ -186,26 +186,26 @@ func TestEncryptionKeyDerivation(t *testing.T) {
 func TestKRBErrorEncoding(t *testing.T) {
 	// Create a KRB-ERROR like what we'd send for PREAUTH_REQUIRED
 	// Including the ETYPE-INFO2 data that we actually send
-	etypeInfo := []ETypeInfo2Entry{{
-		EType: ETypeAES256SHA1,
+	etypeInfo := []eTypeInfo2Entry{{
+		EType: eTypeAES256SHA1,
 		Salt:  "TEST.GOSMB.LOCALalice",
 	}}
 	etypeInfoBytes, _ := asn1.Marshal(etypeInfo)
 
-	errData := []PAData{{
-		PADataType:  paETypeInfo2,
+	errData := []paData{{
+		PADataType:  paTypeETypeInfo2,
 		PADataValue: etypeInfoBytes,
 	}}
 	errDataBytes, _ := asn1.Marshal(errData)
 
-	err := KRBError{
+	err := krbError{
 		PVNO:      5,
 		MsgType:   msgTypeError,
 		STime:     time.Now().UTC(),
 		SUSec:     0,
 		ErrorCode: errPreAuthRequired,
 		Realm:     "TEST.GOSMB.LOCAL",
-		SName: PrincipalName{
+		SName: principalName{
 			NameType:   nameTypeSrvInst,
 			NameString: []string{"krbtgt", "TEST.GOSMB.LOCAL"},
 		},
@@ -253,15 +253,15 @@ func TestKRBErrorEncoding(t *testing.T) {
 
 func TestASRepEncoding(t *testing.T) {
 	// Create a minimal AS-REP
-	ticket := Ticket{
+	ticket := ticket{
 		TktVNO: 5,
 		Realm:  "TEST.REALM",
-		SName: PrincipalName{
+		SName: principalName{
 			NameType:   nameTypeSrvInst,
 			NameString: []string{"krbtgt", "TEST.REALM"},
 		},
-		EncPart: EncryptedData{
-			EType:  ETypeAES256SHA1,
+		EncPart: encryptedData{
+			EType:  eTypeAES256SHA1,
 			Cipher: []byte{0x01, 0x02, 0x03},
 		},
 	}
@@ -271,17 +271,17 @@ func TestASRepEncoding(t *testing.T) {
 		t.Fatalf("Marshal ticket: %v", err)
 	}
 
-	rep := ASRep{
+	rep := asRep{
 		PVNO:    5,
 		MsgType: msgTypeASRep,
 		CRealm:  "TEST.REALM",
-		CName: PrincipalName{
+		CName: principalName{
 			NameType:   nameTypePrincipal,
 			NameString: []string{"user"},
 		},
 		TicketBytes: ticketBytes,
-		EncPart: EncryptedData{
-			EType:  ETypeAES256SHA1,
+		EncPart: encryptedData{
+			EType:  eTypeAES256SHA1,
 			KVNO:   1,
 			Cipher: []byte{0x04, 0x05, 0x06},
 		},
@@ -313,7 +313,7 @@ func TestASRepEncoding(t *testing.T) {
 	if parsed.PVNO != 5 {
 		t.Errorf("PVNO mismatch: got %d, want 5", parsed.PVNO)
 	}
-	if parsed.EncPart.EType != ETypeAES256SHA1 {
-		t.Errorf("EncPart.EType mismatch: got %d, want %d", parsed.EncPart.EType, ETypeAES256SHA1)
+	if parsed.EncPart.EType != eTypeAES256SHA1 {
+		t.Errorf("EncPart.EType mismatch: got %d, want %d", parsed.EncPart.EType, eTypeAES256SHA1)
 	}
 }

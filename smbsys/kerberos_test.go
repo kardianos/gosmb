@@ -3,12 +3,12 @@ package smbsys_test
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/kardianos/gosmb/krb5"
+	"github.com/kardianos/gosmb/smblog"
 	"github.com/kardianos/gosmb/smbsys"
 )
 
@@ -38,16 +38,45 @@ func (a *krb5Adapter) SPNEGOConfig() *smbsys.SPNEGOConfig {
 	}
 }
 
-// testClientAuth is a simple client authenticator for testing.
-type testClientAuth struct {
-	users map[string]string // principal -> password
+// testPrincipalStore is a simple principal store for testing.
+// Stores pre-computed AES256 keys for both users and services.
+type testPrincipalStore struct {
+	users    map[string][]byte // user principal -> key
+	services map[string][]byte // service principal -> key
 }
 
-func (a *testClientAuth) Authenticate(principal, realm string) (string, error) {
-	if pw, ok := a.users[principal]; ok {
-		return pw, nil
+func (s *testPrincipalStore) GetKey(principalType krb5.PrincipalType, principal, realm string) ([]byte, error) {
+	switch principalType {
+	case krb5.PrincipalUser:
+		if key, ok := s.users[principal]; ok {
+			return key, nil
+		}
+		return nil, fmt.Errorf("user not found: %s", principal)
+	case krb5.PrincipalService:
+		if key, ok := s.services[principal]; ok {
+			return key, nil
+		}
+		return nil, fmt.Errorf("service not found: %s", principal)
+	default:
+		return nil, fmt.Errorf("unknown principal type: %v", principalType)
 	}
-	return "", fmt.Errorf("user not found: %s", principal)
+}
+
+// newTestPrincipalStore creates a test principal store with keys derived from passwords.
+func newTestPrincipalStore(realm string, users, services map[string]string) *testPrincipalStore {
+	store := &testPrincipalStore{
+		users:    make(map[string][]byte),
+		services: make(map[string][]byte),
+	}
+	for principal, password := range users {
+		key, _ := krb5.DeriveKey(password, principal, realm)
+		store.users[principal] = key
+	}
+	for principal, password := range services {
+		key, _ := krb5.DeriveKey(password, principal, realm)
+		store.services[principal] = key
+	}
+	return store
 }
 
 func TestKerberosAuthFlow(t *testing.T) {
@@ -62,16 +91,12 @@ func TestKerberosAuthFlow(t *testing.T) {
 	kdc, err := krb5.NewKDC(krb5.KDCConfig{
 		Realm:      realm,
 		ListenAddr: "127.0.0.1:0", // Random port
-		ClientAuth: &testClientAuth{
-			users: map[string]string{
-				clientPrincipal: clientPassword,
-			},
-		},
-		Services: map[string]string{
-			servicePrincipal: servicePassword,
-		},
+		Principals: newTestPrincipalStore(realm,
+			map[string]string{clientPrincipal: clientPassword},
+			map[string]string{servicePrincipal: servicePassword},
+		),
 		TicketLifetime: 1 * time.Hour,
-		Logger:         log.New(os.Stderr, "", log.LstdFlags),
+		Logger:         smblog.New(os.Stderr),
 	})
 	if err != nil {
 		t.Fatalf("NewKDC: %v", err)

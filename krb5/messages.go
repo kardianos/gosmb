@@ -16,6 +16,9 @@ import (
 	"time"
 )
 
+// Kerberos protocol version (RFC 4120)
+const kerberosVersion = 5
+
 // Kerberos message types (RFC 4120 Section 7.5.7)
 const (
 	msgTypeASReq  = 10
@@ -27,22 +30,33 @@ const (
 	msgTypeError  = 30
 )
 
+// Kerberos APPLICATION tags (RFC 4120)
+const (
+	appTagTicket        = 1
+	appTagAuthenticator = 2
+	appTagEncTicketPart = 3
+	appTagEncASRepPart  = 25
+	appTagEncTGSRepPart = 26
+	appTagEncAPRepPart  = 27
+)
+
 // Kerberos error codes (RFC 4120 Section 7.5.9)
 const (
-	errNone                = 0
-	errClientNotFound      = 6  // KDC_ERR_C_PRINCIPAL_UNKNOWN
-	errServiceNotFound     = 7  // KDC_ERR_S_PRINCIPAL_UNKNOWN
-	errPreAuthRequired     = 25 // KDC_ERR_PREAUTH_REQUIRED
-	errPreAuthFailed       = 24 // KDC_ERR_PREAUTH_FAILED
-	errBadIntegrity        = 31 // KRB_AP_ERR_BAD_INTEGRITY
-	errTicketExpired       = 32 // KRB_AP_ERR_TKT_EXPIRED
-	errGeneric             = 60 // KRB_ERR_GENERIC
+	errNone            = 0
+	errClientNotFound  = 6  // KDC_ERR_C_PRINCIPAL_UNKNOWN
+	errServiceNotFound = 7  // KDC_ERR_S_PRINCIPAL_UNKNOWN
+	errPreAuthRequired = 25 // KDC_ERR_PREAUTH_REQUIRED
+	errPreAuthFailed   = 24 // KDC_ERR_PREAUTH_FAILED
+	errBadIntegrity    = 31 // KRB_AP_ERR_BAD_INTEGRITY
+	errTicketExpired   = 32 // KRB_AP_ERR_TKT_EXPIRED
+	errGeneric         = 60 // KRB_ERR_GENERIC
 )
 
 // Pre-authentication types
 const (
-	paEncTimestamp = 2  // PA-ENC-TIMESTAMP
-	paETypeInfo2   = 19 // PA-ETYPE-INFO2
+	paTypeTGSReq       = 1  // PA-TGS-REQ
+	paTypeEncTimestamp = 2  // PA-ENC-TIMESTAMP
+	paTypeETypeInfo2   = 19 // PA-ETYPE-INFO2
 )
 
 // Name types (RFC 4120 Section 7.5.8)
@@ -53,23 +67,41 @@ const (
 
 // Key usage numbers (RFC 4120 Section 7.5.1)
 const (
-	keyUsageASReqTimestamp   = 1
-	keyUsageASRepEncPart     = 3
-	keyUsageTGSRepEncPart    = 8
-	keyUsageAPReqAuthCksum   = 10
-	keyUsageAPReqAuth        = 11
-	keyUsageAPRepEncPart     = 12
-	keyUsageTicket           = 2
+	keyUsageASReqTimestamp = 1
+	keyUsageTicket         = 2
+	keyUsageASRepEncPart   = 3
+	keyUsageTGSReqAuth     = 7
+	keyUsageTGSRepEncPart  = 8
+	keyUsageAPReqAuthCksum = 10
+	keyUsageAPReqAuth      = 11
+	keyUsageAPRepEncPart   = 12
 )
 
-// PrincipalName represents a Kerberos principal name.
-type PrincipalName struct {
+// KDC option flags (RFC 4120 Section 5.4.1)
+// These are bit flags used in KDC-OPTIONS and ticket flags.
+var (
+	// kdcOptionFlags represents FORWARDABLE | RENEWABLE flags
+	kdcOptionFlags = []byte{0x40, 0x80, 0x00, 0x00}
+	// ticketFlagsInitialPreAuth represents INITIAL | PRE-AUTHENT flags
+	ticketFlagsInitialPreAuth = []byte{0x40, 0x80, 0x00, 0x00}
+)
+
+// AP option flags (RFC 4120 Section 5.5.1)
+var (
+	// apOptionsMutualRequired represents the MUTUAL-REQUIRED flag
+	apOptionsMutualRequired = []byte{0x20, 0x00, 0x00, 0x00}
+	// apOptionsEmpty represents no flags set
+	apOptionsEmpty = []byte{0x00, 0x00, 0x00, 0x00}
+)
+
+// principalName represents a Kerberos principal name.
+type principalName struct {
 	NameType   int32    `asn1:"explicit,tag:0"`
 	NameString []string `asn1:"general,explicit,tag:1"`
 }
 
 // String returns the principal name as a string.
-func (p PrincipalName) String() string {
+func (p principalName) String() string {
 	if len(p.NameString) == 0 {
 		return ""
 	}
@@ -79,8 +111,8 @@ func (p PrincipalName) String() string {
 	return p.NameString[0] + "/" + p.NameString[1]
 }
 
-// EncryptedData holds encrypted content.
-type EncryptedData struct {
+// encryptedData holds encrypted content.
+type encryptedData struct {
 	EType  int32  `asn1:"explicit,tag:0"`
 	KVNO   int    `asn1:"optional,explicit,tag:1"`
 	Cipher []byte `asn1:"explicit,tag:2"`
@@ -92,114 +124,114 @@ type EncryptionKey struct {
 	KeyValue []byte `asn1:"explicit,tag:1"`
 }
 
-// Ticket is a Kerberos ticket.
-type Ticket struct {
+// ticket is a Kerberos ticket.
+type ticket struct {
 	TktVNO  int           `asn1:"explicit,tag:0"`
 	Realm   string        `asn1:"general,explicit,tag:1"`
-	SName   PrincipalName `asn1:"explicit,tag:2"`
-	EncPart EncryptedData `asn1:"explicit,tag:3"`
+	SName   principalName `asn1:"explicit,tag:2"`
+	EncPart encryptedData `asn1:"explicit,tag:3"`
 }
 
-// EncTicketPart is the encrypted part of a ticket.
-type EncTicketPart struct {
+// encTicketPart is the encrypted part of a ticket.
+type encTicketPart struct {
 	Flags     asn1.BitString `asn1:"explicit,tag:0"`
 	Key       EncryptionKey  `asn1:"explicit,tag:1"`
 	CRealm    string         `asn1:"general,explicit,tag:2"`
-	CName     PrincipalName  `asn1:"explicit,tag:3"`
-	Transited TransitedEnc   `asn1:"explicit,tag:4"`
+	CName     principalName  `asn1:"explicit,tag:3"`
+	Transited transitedEnc   `asn1:"explicit,tag:4"`
 	AuthTime  time.Time      `asn1:"generalized,explicit,tag:5"`
 	StartTime time.Time      `asn1:"generalized,optional,explicit,tag:6"`
 	EndTime   time.Time      `asn1:"generalized,explicit,tag:7"`
 	RenewTill time.Time      `asn1:"generalized,optional,explicit,tag:8"`
-	CAddr     []HostAddress  `asn1:"optional,explicit,tag:9"`
-	AuthData  []AuthDataElem `asn1:"optional,explicit,tag:10"`
+	CAddr     []hostAddress  `asn1:"optional,explicit,tag:9"`
+	AuthData  []authDataElem `asn1:"optional,explicit,tag:10"`
 }
 
-// TransitedEnc holds transited realm information.
-type TransitedEnc struct {
+// transitedEnc holds transited realm information.
+type transitedEnc struct {
 	TRType   int32  `asn1:"explicit,tag:0"`
 	Contents []byte `asn1:"explicit,tag:1"`
 }
 
-// HostAddress is a network address.
-type HostAddress struct {
+// hostAddress is a network address.
+type hostAddress struct {
 	AddrType int32  `asn1:"explicit,tag:0"`
 	Address  []byte `asn1:"explicit,tag:1"`
 }
 
-// AuthDataElem is an authorization data element.
-type AuthDataElem struct {
+// authDataElem is an authorization data element.
+type authDataElem struct {
 	ADType int32  `asn1:"explicit,tag:0"`
 	ADData []byte `asn1:"explicit,tag:1"`
 }
 
-// KDCReqBody is the body of an AS-REQ or TGS-REQ.
-type KDCReqBody struct {
-	KDCOptions asn1.BitString        `asn1:"explicit,tag:0"`
-	CName      PrincipalName         `asn1:"optional,explicit,tag:1"`
-	Realm      string                `asn1:"general,explicit,tag:2"`
-	SName      PrincipalName         `asn1:"optional,explicit,tag:3"`
-	From       time.Time             `asn1:"generalized,optional,explicit,tag:4"`
-	Till       time.Time             `asn1:"generalized,explicit,tag:5"`
-	RTime      time.Time             `asn1:"generalized,optional,explicit,tag:6"`
-	Nonce      int64                `asn1:"explicit,tag:7"`
-	EType      []int32               `asn1:"explicit,tag:8"`
-	Addresses  []HostAddress         `asn1:"optional,explicit,tag:9"`
-	EncAuthz   EncryptedData         `asn1:"optional,explicit,tag:10"`
-	AddlTkts   []Ticket              `asn1:"optional,explicit,tag:11"`
+// kdcReqBody is the body of an AS-REQ or TGS-REQ.
+type kdcReqBody struct {
+	KDCOptions asn1.BitString `asn1:"explicit,tag:0"`
+	CName      principalName  `asn1:"optional,explicit,tag:1"`
+	Realm      string         `asn1:"general,explicit,tag:2"`
+	SName      principalName  `asn1:"optional,explicit,tag:3"`
+	From       time.Time      `asn1:"generalized,optional,explicit,tag:4"`
+	Till       time.Time      `asn1:"generalized,explicit,tag:5"`
+	RTime      time.Time      `asn1:"generalized,optional,explicit,tag:6"`
+	Nonce      int64          `asn1:"explicit,tag:7"`
+	EType      []int32        `asn1:"explicit,tag:8"`
+	Addresses  []hostAddress  `asn1:"optional,explicit,tag:9"`
+	EncAuthz   encryptedData  `asn1:"optional,explicit,tag:10"`
+	AddlTkts   []ticket       `asn1:"optional,explicit,tag:11"`
 }
 
-// PAData is pre-authentication data.
-type PAData struct {
+// paData is pre-authentication data.
+type paData struct {
 	PADataType  int32  `asn1:"explicit,tag:1"`
 	PADataValue []byte `asn1:"explicit,tag:2"`
 }
 
-// ASReq is an Authentication Service request.
-type ASReq struct {
+// asReq is an Authentication Service request.
+type asReq struct {
 	PVNO    int        `asn1:"explicit,tag:1"`
 	MsgType int        `asn1:"explicit,tag:2"`
-	PAData  []PAData   `asn1:"optional,explicit,tag:3"`
-	ReqBody KDCReqBody `asn1:"explicit,tag:4"`
+	PAData  []paData   `asn1:"optional,explicit,tag:3"`
+	ReqBody kdcReqBody `asn1:"explicit,tag:4"`
 }
 
-// TGSReq is a Ticket Granting Service request.
-type TGSReq struct {
+// tgsReq is a Ticket Granting Service request.
+type tgsReq struct {
 	PVNO    int        `asn1:"explicit,tag:1"`
 	MsgType int        `asn1:"explicit,tag:2"`
-	PAData  []PAData   `asn1:"optional,explicit,tag:3"`
-	ReqBody KDCReqBody `asn1:"explicit,tag:4"`
+	PAData  []paData   `asn1:"optional,explicit,tag:3"`
+	ReqBody kdcReqBody `asn1:"explicit,tag:4"`
 }
 
-// ASRep is an Authentication Service reply.
+// asRep is an Authentication Service reply.
 // Note: TicketBytes holds the pre-marshaled ticket with APPLICATION 1 tag.
-type ASRep struct {
+type asRep struct {
 	PVNO        int           `asn1:"explicit,tag:0"`
 	MsgType     int           `asn1:"explicit,tag:1"`
-	PAData      []PAData      `asn1:"optional,explicit,tag:2"`
+	PAData      []paData      `asn1:"optional,explicit,tag:2"`
 	CRealm      string        `asn1:"general,explicit,tag:3"`
-	CName       PrincipalName `asn1:"explicit,tag:4"`
+	CName       principalName `asn1:"explicit,tag:4"`
 	TicketBytes []byte        `asn1:"-"` // Manually handled - not marshaled by asn1
-	EncPart     EncryptedData `asn1:"explicit,tag:6"`
+	EncPart     encryptedData `asn1:"explicit,tag:6"`
 }
 
-// TGSRep is a Ticket Granting Service reply.
+// tgsRep is a Ticket Granting Service reply.
 // Note: TicketBytes holds the pre-marshaled ticket with APPLICATION 1 tag.
-type TGSRep struct {
+type tgsRep struct {
 	PVNO        int           `asn1:"explicit,tag:0"`
 	MsgType     int           `asn1:"explicit,tag:1"`
-	PAData      []PAData      `asn1:"optional,explicit,tag:2"`
+	PAData      []paData      `asn1:"optional,explicit,tag:2"`
 	CRealm      string        `asn1:"general,explicit,tag:3"`
-	CName       PrincipalName `asn1:"explicit,tag:4"`
+	CName       principalName `asn1:"explicit,tag:4"`
 	TicketBytes []byte        `asn1:"-"` // Manually handled - not marshaled by asn1
-	EncPart     EncryptedData `asn1:"explicit,tag:6"`
+	EncPart     encryptedData `asn1:"explicit,tag:6"`
 }
 
-// EncKDCRepPart is the encrypted part of AS-REP or TGS-REP.
-type EncKDCRepPart struct {
+// encKDCRepPart is the encrypted part of AS-REP or TGS-REP.
+type encKDCRepPart struct {
 	Key       EncryptionKey  `asn1:"explicit,tag:0"`
-	LastReq   []LastReqEntry `asn1:"explicit,tag:1"`
-	Nonce     int64       `asn1:"explicit,tag:2"`
+	LastReq   []lastReqEntry `asn1:"explicit,tag:1"`
+	Nonce     int64          `asn1:"explicit,tag:2"`
 	KeyExp    time.Time      `asn1:"generalized,optional,explicit,tag:3"`
 	Flags     asn1.BitString `asn1:"explicit,tag:4"`
 	AuthTime  time.Time      `asn1:"generalized,explicit,tag:5"`
@@ -207,18 +239,18 @@ type EncKDCRepPart struct {
 	EndTime   time.Time      `asn1:"generalized,explicit,tag:7"`
 	RenewTill time.Time      `asn1:"generalized,optional,explicit,tag:8"`
 	SRealm    string         `asn1:"general,explicit,tag:9"`
-	SName     PrincipalName  `asn1:"explicit,tag:10"`
-	CAddr     []HostAddress  `asn1:"optional,explicit,tag:11"`
+	SName     principalName  `asn1:"explicit,tag:10"`
+	CAddr     []hostAddress  `asn1:"optional,explicit,tag:11"`
 }
 
-// LastReqEntry is a last request timestamp entry.
-type LastReqEntry struct {
+// lastReqEntry is a last request timestamp entry.
+type lastReqEntry struct {
 	LRType  int32     `asn1:"explicit,tag:0"`
 	LRValue time.Time `asn1:"generalized,explicit,tag:1"`
 }
 
-// KRBError is a Kerberos error message.
-type KRBError struct {
+// krbError is a Kerberos error message.
+type krbError struct {
 	PVNO      int           `asn1:"explicit,tag:0"`
 	MsgType   int           `asn1:"explicit,tag:1"`
 	CTime     time.Time     `asn1:"generalized,optional,explicit,tag:2"`
@@ -227,72 +259,72 @@ type KRBError struct {
 	SUSec     int           `asn1:"explicit,tag:5"`
 	ErrorCode int32         `asn1:"explicit,tag:6"`
 	CRealm    string        `asn1:"general,optional,explicit,tag:7"`
-	CName     PrincipalName `asn1:"optional,explicit,tag:8"`
+	CName     principalName `asn1:"optional,explicit,tag:8"`
 	Realm     string        `asn1:"general,explicit,tag:9"`
-	SName     PrincipalName `asn1:"explicit,tag:10"`
+	SName     principalName `asn1:"explicit,tag:10"`
 	EText     string        `asn1:"general,optional,explicit,tag:11"`
 	EData     []byte        `asn1:"optional,explicit,tag:12"`
 }
 
-// APReq is an Application Request (sent to services).
+// apReq is an Application Request (sent to services).
 // Note: TicketBytes holds the pre-marshaled ticket with APPLICATION 1 tag.
-type APReq struct {
+type apReq struct {
 	PVNO        int            `asn1:"explicit,tag:0"`
 	MsgType     int            `asn1:"explicit,tag:1"`
 	APOptions   asn1.BitString `asn1:"explicit,tag:2"`
 	TicketBytes []byte         `asn1:"-"` // Manually handled - not marshaled by asn1
-	Auth        EncryptedData  `asn1:"explicit,tag:4"`
+	Auth        encryptedData  `asn1:"explicit,tag:4"`
 }
 
-// Authenticator is the encrypted authenticator in AP-REQ.
-type Authenticator struct {
-	AuthVNO       int           `asn1:"explicit,tag:0"`
-	CRealm        string        `asn1:"general,explicit,tag:1"`
-	CName         PrincipalName `asn1:"explicit,tag:2"`
-	Cksum         Checksum      `asn1:"optional,explicit,tag:3"`
-	CUSec         int           `asn1:"explicit,tag:4"`
-	CTime         time.Time     `asn1:"generalized,explicit,tag:5"`
-	SubKey        EncryptionKey `asn1:"optional,explicit,tag:6"`
-	SeqNumber     int64      `asn1:"optional,explicit,tag:7"`
-	AuthData      []AuthDataElem `asn1:"optional,explicit,tag:8"`
+// authenticator is the encrypted authenticator in AP-REQ.
+type authenticator struct {
+	AuthVNO   int            `asn1:"explicit,tag:0"`
+	CRealm    string         `asn1:"general,explicit,tag:1"`
+	CName     principalName  `asn1:"explicit,tag:2"`
+	Cksum     checksum       `asn1:"optional,explicit,tag:3"`
+	CUSec     int            `asn1:"explicit,tag:4"`
+	CTime     time.Time      `asn1:"generalized,explicit,tag:5"`
+	SubKey    EncryptionKey  `asn1:"optional,explicit,tag:6"`
+	SeqNumber int64          `asn1:"optional,explicit,tag:7"`
+	AuthData  []authDataElem `asn1:"optional,explicit,tag:8"`
 }
 
-// Checksum is a Kerberos checksum.
-type Checksum struct {
+// checksum is a Kerberos checksum.
+type checksum struct {
 	CksumType int32  `asn1:"explicit,tag:0"`
 	Checksum  []byte `asn1:"explicit,tag:1"`
 }
 
-// APRep is an Application Reply.
-type APRep struct {
+// apRep is an Application Reply.
+type apRep struct {
 	PVNO    int           `asn1:"explicit,tag:0"`
 	MsgType int           `asn1:"explicit,tag:1"`
-	EncPart EncryptedData `asn1:"explicit,tag:2"`
+	EncPart encryptedData `asn1:"explicit,tag:2"`
 }
 
-// EncAPRepPart is the encrypted part of AP-REP.
-type EncAPRepPart struct {
+// encAPRepPart is the encrypted part of AP-REP.
+type encAPRepPart struct {
 	CTime     time.Time     `asn1:"generalized,explicit,tag:0"`
 	CUSec     int           `asn1:"explicit,tag:1"`
 	SubKey    EncryptionKey `asn1:"optional,explicit,tag:2"`
 	SeqNumber int64         `asn1:"optional,explicit,tag:3"`
 }
 
-// PAEncTimestamp is the encrypted timestamp for pre-authentication.
-type PAEncTimestamp struct {
+// paEncTimestamp is the encrypted timestamp for pre-authentication.
+type paEncTimestamp struct {
 	PATimestamp time.Time `asn1:"generalized,explicit,tag:0"`
 	PAUSec      int       `asn1:"optional,explicit,tag:1"`
 }
 
-// ETypeInfo2Entry provides encryption type info for pre-auth.
-type ETypeInfo2Entry struct {
-	EType int32  `asn1:"explicit,tag:0"`
-	Salt  string `asn1:"general,optional,explicit,tag:1"`
+// eTypeInfo2Entry provides encryption type info for pre-auth.
+type eTypeInfo2Entry struct {
+	EType     int32  `asn1:"explicit,tag:0"`
+	Salt      string `asn1:"general,optional,explicit,tag:1"`
 	S2KParams []byte `asn1:"optional,explicit,tag:2"`
 }
 
 // marshalETypeInfo2 marshals ETYPE-INFO2 with GeneralString for salt.
-func marshalETypeInfo2(entries []ETypeInfo2Entry) ([]byte, error) {
+func marshalETypeInfo2(entries []eTypeInfo2Entry) ([]byte, error) {
 	var entriesBytes []byte
 	for _, e := range entries {
 		var parts []byte
@@ -318,7 +350,7 @@ func marshalETypeInfo2(entries []ETypeInfo2Entry) ([]byte, error) {
 }
 
 // marshalPAData marshals pre-authentication data with proper encoding.
-func marshalPAData(data []PAData) ([]byte, error) {
+func marshalPAData(data []paData) ([]byte, error) {
 	var entries []byte
 	for _, pa := range data {
 		var parts []byte
@@ -337,13 +369,13 @@ func marshalPAData(data []PAData) ([]byte, error) {
 }
 
 // marshalASReq marshals an AS-REQ with APPLICATION 10 tag.
-func marshalASReq(req ASReq) ([]byte, error) {
+func marshalASReq(req asReq) ([]byte, error) {
 	return marshalWithAppTag(req, msgTypeASReq)
 }
 
 // marshalASRep marshals an AS-REP with APPLICATION 11 tag.
 // This manually constructs the ASN.1 to properly include the ticket with APPLICATION 1 tag.
-func marshalASRep(rep ASRep) ([]byte, error) {
+func marshalASRep(rep asRep) ([]byte, error) {
 	// Build each field manually with explicit tags
 	var parts []byte
 
@@ -399,13 +431,13 @@ func marshalASRep(rep ASRep) ([]byte, error) {
 }
 
 // marshalTGSReq marshals a TGS-REQ with APPLICATION 12 tag.
-func marshalTGSReq(req TGSReq) ([]byte, error) {
+func marshalTGSReq(req tgsReq) ([]byte, error) {
 	return marshalWithAppTag(req, msgTypeTGSReq)
 }
 
 // marshalTGSRep marshals a TGS-REP with APPLICATION 13 tag.
 // This manually constructs the ASN.1 to properly include the ticket with APPLICATION 1 tag.
-func marshalTGSRep(rep TGSRep) ([]byte, error) {
+func marshalTGSRep(rep tgsRep) ([]byte, error) {
 	// Build each field manually with explicit tags
 	var parts []byte
 
@@ -462,7 +494,7 @@ func marshalTGSRep(rep TGSRep) ([]byte, error) {
 
 // marshalTicket marshals a Ticket with APPLICATION 1 tag.
 // This manually constructs the ASN.1 to properly encode GeneralStrings.
-func marshalTicket(t Ticket) ([]byte, error) {
+func marshalTicket(t ticket) ([]byte, error) {
 	var parts []byte
 
 	// Tag 0: tkt-vno
@@ -493,13 +525,13 @@ func marshalTicket(t Ticket) ([]byte, error) {
 	// Wrap in SEQUENCE
 	seq := wrapSequence(parts)
 
-	// Wrap in APPLICATION 1
-	return wrapApplication(1, seq), nil
+	// Wrap in APPLICATION tag for Ticket
+	return wrapApplication(appTagTicket, seq), nil
 }
 
 // marshalAPReq marshals an AP-REQ with APPLICATION 14 tag.
 // This manually constructs the ASN.1 to properly include the ticket with APPLICATION 1 tag.
-func marshalAPReq(req APReq) ([]byte, error) {
+func marshalAPReq(req apReq) ([]byte, error) {
 	// Build each field manually with explicit tags
 	var parts []byte
 
@@ -542,13 +574,13 @@ func marshalAPReq(req APReq) ([]byte, error) {
 }
 
 // marshalAPRep marshals an AP-REP with APPLICATION 15 tag.
-func marshalAPRep(rep APRep) ([]byte, error) {
+func marshalAPRep(rep apRep) ([]byte, error) {
 	return marshalWithAppTag(rep, msgTypeAPRep)
 }
 
 // marshalKRBError marshals a KRB-ERROR with APPLICATION 30 tag.
 // This manually constructs the ASN.1 to ensure GeneralString encoding for string fields.
-func marshalKRBError(e KRBError) ([]byte, error) {
+func marshalKRBError(e krbError) ([]byte, error) {
 	var parts []byte
 
 	// Tag 0: PVNO
@@ -618,7 +650,7 @@ func marshalKRBError(e KRBError) ([]byte, error) {
 
 // marshalEncTicketPart marshals EncTicketPart with APPLICATION 3 tag.
 // This manually constructs the ASN.1 to properly encode GeneralStrings.
-func marshalEncTicketPart(e EncTicketPart) ([]byte, error) {
+func marshalEncTicketPart(e encTicketPart) ([]byte, error) {
 	var parts []byte
 
 	// Tag 0: flags
@@ -706,23 +738,23 @@ func marshalEncTicketPart(e EncTicketPart) ([]byte, error) {
 	// Wrap in SEQUENCE
 	seq := wrapSequence(parts)
 
-	// Wrap in APPLICATION 3
-	return wrapApplication(3, seq), nil
+	// Wrap in APPLICATION tag for EncTicketPart
+	return wrapApplication(appTagEncTicketPart, seq), nil
 }
 
-// marshalEncASRepPart marshals EncKDCRepPart with APPLICATION 25 tag (for AS-REP).
-func marshalEncASRepPart(e EncKDCRepPart) ([]byte, error) {
-	return marshalEncKDCRepPart(e, 25)
+// marshalEncASRepPart marshals EncKDCRepPart with APPLICATION tag for AS-REP.
+func marshalEncASRepPart(e encKDCRepPart) ([]byte, error) {
+	return marshalEncKDCRepPart(e, appTagEncASRepPart)
 }
 
-// marshalEncTGSRepPart marshals EncKDCRepPart with APPLICATION 26 tag (for TGS-REP).
-func marshalEncTGSRepPart(e EncKDCRepPart) ([]byte, error) {
-	return marshalEncKDCRepPart(e, 26)
+// marshalEncTGSRepPart marshals EncKDCRepPart with APPLICATION tag for TGS-REP.
+func marshalEncTGSRepPart(e encKDCRepPart) ([]byte, error) {
+	return marshalEncKDCRepPart(e, appTagEncTGSRepPart)
 }
 
 // marshalEncKDCRepPart marshals EncKDCRepPart with the specified APPLICATION tag.
 // This manually constructs the ASN.1 to properly encode GeneralStrings.
-func marshalEncKDCRepPart(e EncKDCRepPart, appTag int) ([]byte, error) {
+func marshalEncKDCRepPart(e encKDCRepPart, appTag int) ([]byte, error) {
 	var parts []byte
 
 	// Tag 0: key
@@ -822,7 +854,7 @@ func marshalEncKDCRepPart(e EncKDCRepPart, appTag int) ([]byte, error) {
 }
 
 // marshalLastReq marshals LastReq as a SEQUENCE OF LastReqEntry.
-func marshalLastReq(entries []LastReqEntry) ([]byte, error) {
+func marshalLastReq(entries []lastReqEntry) ([]byte, error) {
 	var entriesBytes []byte
 	for _, entry := range entries {
 		var parts []byte
@@ -848,7 +880,7 @@ func marshalLastReq(entries []LastReqEntry) ([]byte, error) {
 
 // marshalAuthenticator marshals Authenticator with APPLICATION 2 tag.
 // This manually constructs the ASN.1 to properly encode GeneralStrings.
-func marshalAuthenticator(a Authenticator) ([]byte, error) {
+func marshalAuthenticator(a authenticator) ([]byte, error) {
 	var parts []byte
 
 	// Tag 0: authenticator-vno
@@ -922,13 +954,13 @@ func marshalAuthenticator(a Authenticator) ([]byte, error) {
 	// Wrap in SEQUENCE
 	seq := wrapSequence(parts)
 
-	// Wrap in APPLICATION 2
-	return wrapApplication(2, seq), nil
+	// Wrap in APPLICATION tag for Authenticator
+	return wrapApplication(appTagAuthenticator, seq), nil
 }
 
-// marshalEncAPRepPart marshals EncAPRepPart with APPLICATION 27 tag.
-func marshalEncAPRepPart(e EncAPRepPart) ([]byte, error) {
-	return marshalWithAppTag(e, 27)
+// marshalEncAPRepPart marshals EncAPRepPart with APPLICATION tag.
+func marshalEncAPRepPart(e encAPRepPart) ([]byte, error) {
+	return marshalWithAppTag(e, appTagEncAPRepPart)
 }
 
 // marshalWithAppTag marshals a value wrapped in an APPLICATION tag.
@@ -968,7 +1000,7 @@ func marshalGeneralString(s string) []byte {
 }
 
 // marshalPrincipalName marshals a PrincipalName with GeneralString encoding.
-func marshalPrincipalName(p PrincipalName) ([]byte, error) {
+func marshalPrincipalName(p principalName) ([]byte, error) {
 	var parts []byte
 
 	// Tag 0: name-type
@@ -1037,7 +1069,7 @@ func wrapTag(class, tag int, isCompound bool, content []byte) []byte {
 }
 
 // unmarshalASReq unmarshals an AS-REQ from APPLICATION 10 tagged data.
-func unmarshalASReq(data []byte) (*ASReq, error) {
+func unmarshalASReq(data []byte) (*asReq, error) {
 	inner, tag, err := unwrapAppTag(data)
 	if err != nil {
 		return nil, err
@@ -1045,7 +1077,7 @@ func unmarshalASReq(data []byte) (*ASReq, error) {
 	if tag != msgTypeASReq {
 		return nil, fmt.Errorf("expected AS-REQ (tag 10), got tag %d", tag)
 	}
-	var req ASReq
+	var req asReq
 	_, err = asn1.Unmarshal(inner, &req)
 	if err != nil {
 		return nil, err
@@ -1054,7 +1086,7 @@ func unmarshalASReq(data []byte) (*ASReq, error) {
 }
 
 // unmarshalTGSReq unmarshals a TGS-REQ from APPLICATION 12 tagged data.
-func unmarshalTGSReq(data []byte) (*TGSReq, error) {
+func unmarshalTGSReq(data []byte) (*tgsReq, error) {
 	inner, tag, err := unwrapAppTag(data)
 	if err != nil {
 		return nil, err
@@ -1062,7 +1094,7 @@ func unmarshalTGSReq(data []byte) (*TGSReq, error) {
 	if tag != msgTypeTGSReq {
 		return nil, fmt.Errorf("expected TGS-REQ (tag 12), got tag %d", tag)
 	}
-	var req TGSReq
+	var req tgsReq
 	_, err = asn1.Unmarshal(inner, &req)
 	if err != nil {
 		return nil, err
@@ -1072,7 +1104,7 @@ func unmarshalTGSReq(data []byte) (*TGSReq, error) {
 
 // unmarshalAPReq unmarshals an AP-REQ from APPLICATION 14 tagged data.
 // This manually parses to extract the ticket bytes with APPLICATION 1 tag preserved.
-func unmarshalAPReq(data []byte) (*APReq, error) {
+func unmarshalAPReq(data []byte) (*apReq, error) {
 	inner, tag, err := unwrapAppTag(data)
 	if err != nil {
 		return nil, err
@@ -1088,7 +1120,7 @@ func unmarshalAPReq(data []byte) (*APReq, error) {
 	}
 
 	// Parse the fields inside the SEQUENCE
-	var req APReq
+	var req apReq
 	rest := seqRaw.Bytes
 	for len(rest) > 0 {
 		var field asn1.RawValue
@@ -1123,7 +1155,7 @@ func unmarshalAPReq(data []byte) (*APReq, error) {
 		case 3: // ticket - preserve raw bytes including APPLICATION 1 tag
 			req.TicketBytes = field.Bytes
 		case 4: // authenticator
-			var auth EncryptedData
+			var auth encryptedData
 			if _, err := asn1.Unmarshal(field.Bytes, &auth); err != nil {
 				return nil, fmt.Errorf("unmarshal authenticator: %w", err)
 			}
@@ -1136,7 +1168,7 @@ func unmarshalAPReq(data []byte) (*APReq, error) {
 
 // unmarshalASRep unmarshals an AS-REP from APPLICATION 11 tagged data.
 // This manually parses to extract the ticket bytes with APPLICATION 1 tag preserved.
-func unmarshalASRep(data []byte) (*ASRep, error) {
+func unmarshalASRep(data []byte) (*asRep, error) {
 	inner, tag, err := unwrapAppTag(data)
 	if err != nil {
 		return nil, err
@@ -1152,7 +1184,7 @@ func unmarshalASRep(data []byte) (*ASRep, error) {
 	}
 
 	// Parse the fields inside the SEQUENCE
-	var rep ASRep
+	var rep asRep
 	rest := seqRaw.Bytes
 	for len(rest) > 0 {
 		var field asn1.RawValue
@@ -1179,7 +1211,7 @@ func unmarshalASRep(data []byte) (*ASRep, error) {
 			}
 			rep.MsgType = msgType
 		case 2: // padata (optional)
-			var padata []PAData
+			var padata []paData
 			if _, err := asn1.Unmarshal(field.Bytes, &padata); err != nil {
 				return nil, fmt.Errorf("unmarshal padata: %w", err)
 			}
@@ -1191,7 +1223,7 @@ func unmarshalASRep(data []byte) (*ASRep, error) {
 			}
 			rep.CRealm = crealm
 		case 4: // cname
-			var cname PrincipalName
+			var cname principalName
 			if _, err := asn1.Unmarshal(field.Bytes, &cname); err != nil {
 				return nil, fmt.Errorf("unmarshal cname: %w", err)
 			}
@@ -1199,7 +1231,7 @@ func unmarshalASRep(data []byte) (*ASRep, error) {
 		case 5: // ticket - preserve raw bytes including APPLICATION 1 tag
 			rep.TicketBytes = field.Bytes
 		case 6: // enc-part
-			var encPart EncryptedData
+			var encPart encryptedData
 			if _, err := asn1.Unmarshal(field.Bytes, &encPart); err != nil {
 				return nil, fmt.Errorf("unmarshal enc-part: %w", err)
 			}
@@ -1212,7 +1244,7 @@ func unmarshalASRep(data []byte) (*ASRep, error) {
 
 // unmarshalTGSRep unmarshals a TGS-REP from APPLICATION 13 tagged data.
 // This manually parses to extract the ticket bytes with APPLICATION 1 tag preserved.
-func unmarshalTGSRep(data []byte) (*TGSRep, error) {
+func unmarshalTGSRep(data []byte) (*tgsRep, error) {
 	inner, tag, err := unwrapAppTag(data)
 	if err != nil {
 		return nil, err
@@ -1228,7 +1260,7 @@ func unmarshalTGSRep(data []byte) (*TGSRep, error) {
 	}
 
 	// Parse the fields inside the SEQUENCE
-	var rep TGSRep
+	var rep tgsRep
 	rest := seqRaw.Bytes
 	for len(rest) > 0 {
 		var field asn1.RawValue
@@ -1255,7 +1287,7 @@ func unmarshalTGSRep(data []byte) (*TGSRep, error) {
 			}
 			rep.MsgType = msgType
 		case 2: // padata (optional)
-			var padata []PAData
+			var padata []paData
 			if _, err := asn1.Unmarshal(field.Bytes, &padata); err != nil {
 				return nil, fmt.Errorf("unmarshal padata: %w", err)
 			}
@@ -1267,7 +1299,7 @@ func unmarshalTGSRep(data []byte) (*TGSRep, error) {
 			}
 			rep.CRealm = crealm
 		case 4: // cname
-			var cname PrincipalName
+			var cname principalName
 			if _, err := asn1.Unmarshal(field.Bytes, &cname); err != nil {
 				return nil, fmt.Errorf("unmarshal cname: %w", err)
 			}
@@ -1275,7 +1307,7 @@ func unmarshalTGSRep(data []byte) (*TGSRep, error) {
 		case 5: // ticket - preserve raw bytes including APPLICATION 1 tag
 			rep.TicketBytes = field.Bytes
 		case 6: // enc-part
-			var encPart EncryptedData
+			var encPart encryptedData
 			if _, err := asn1.Unmarshal(field.Bytes, &encPart); err != nil {
 				return nil, fmt.Errorf("unmarshal enc-part: %w", err)
 			}
@@ -1286,43 +1318,16 @@ func unmarshalTGSRep(data []byte) (*TGSRep, error) {
 	return &rep, nil
 }
 
-// ticketFromRawValue extracts a Ticket struct from a RawValue.
-// The RawValue should contain an APPLICATION 1 tagged ticket.
-func ticketFromRawValue(raw asn1.RawValue) (*Ticket, error) {
-	// Re-marshal the RawValue to get full bytes including APPLICATION tag
-	data, err := asn1.Marshal(raw)
-	if err != nil {
-		return nil, fmt.Errorf("marshal raw: %w", err)
-	}
-	return unmarshalTicket(data)
-}
-
-// ticketToRawValue converts a Ticket struct to a RawValue with APPLICATION 1 tag.
-func ticketToRawValue(t Ticket) (asn1.RawValue, error) {
-	// Marshal ticket with APPLICATION 1 tag
-	ticketBytes, err := marshalTicket(t)
-	if err != nil {
-		return asn1.RawValue{}, fmt.Errorf("marshal ticket: %w", err)
-	}
-
-	// Parse into RawValue to preserve APPLICATION 1 tag
-	var raw asn1.RawValue
-	if _, err := asn1.Unmarshal(ticketBytes, &raw); err != nil {
-		return asn1.RawValue{}, fmt.Errorf("unmarshal ticket raw: %w", err)
-	}
-	return raw, nil
-}
-
-// unmarshalTicket unmarshals a Ticket from APPLICATION 1 tagged data.
-func unmarshalTicket(data []byte) (*Ticket, error) {
+// unmarshalTicket unmarshals a Ticket from APPLICATION tagged data.
+func unmarshalTicket(data []byte) (*ticket, error) {
 	inner, tag, err := unwrapAppTag(data)
 	if err != nil {
 		return nil, err
 	}
-	if tag != 1 {
-		return nil, fmt.Errorf("expected Ticket (tag 1), got tag %d", tag)
+	if tag != appTagTicket {
+		return nil, fmt.Errorf("expected Ticket (tag %d), got tag %d", appTagTicket, tag)
 	}
-	var t Ticket
+	var t ticket
 	_, err = asn1.Unmarshal(inner, &t)
 	if err != nil {
 		return nil, err

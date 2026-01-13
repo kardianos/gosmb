@@ -13,10 +13,10 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 	"unicode/utf16"
 	"unsafe"
 
+	"github.com/kardianos/gosmb/smblog"
 	"golang.org/x/crypto/md4"
 	"golang.org/x/sys/unix"
 )
@@ -232,99 +232,126 @@ func SecureServerConfig() ServerConfig {
 // --- Logging ---
 
 // LogArea identifies different logging areas for filtering.
-type LogArea int
+// This is an alias for smblog.Area for backward compatibility.
+type LogArea = smblog.Area
 
+// Log area constants for backward compatibility.
 const (
-	LogAreaGeneral LogArea = iota
-	LogAreaNetlink
-	LogAreaRPC
-	LogAreaAuth
-	LogAreaShare
-	LogAreaTree
+	LogAreaGeneral = smblog.AreaGeneral
+	LogAreaNetlink = smblog.AreaNetlink
+	LogAreaRPC     = smblog.AreaRPC
+	LogAreaAuth    = smblog.AreaAuth
+	LogAreaShare   = smblog.AreaShare
+	LogAreaTree    = smblog.AreaTree
 )
 
 // Logger provides logging with areas and verbosity control.
-type Logger struct {
-	output    io.Writer
-	enabled   bool
-	verbosity int              // 0=errors only, 1=info, 2=debug, 3=trace
-	areas     map[LogArea]bool // nil means all areas enabled
-}
+// This is an alias for smblog.Logger for backward compatibility.
+type Logger = smblog.Logger
 
 // NewLogger creates a new logger. If output is nil, logging is disabled.
 func NewLogger(output io.Writer) *Logger {
-	return &Logger{
-		output:    output,
-		enabled:   output != nil,
-		verbosity: 1,
-		areas:     nil, // all areas enabled by default
+	return smblog.New(output)
+}
+
+// --- Named Pipe Handlers ---
+
+// RPCInterfaceHandler handles DCE/RPC transactions for a specific RPC interface.
+// Register handlers by interface UUID using PipeRegistry.RegisterInterface.
+//
+// This allows external systems (like a KDC) to implement MS-RPC protocols:
+//   - MS-SAMR - Security Account Manager for user/group management
+//   - MS-NRPC - NetLogon for domain join and secure channel
+//   - MS-LSAD - Local Security Authority for policy/trust
+//
+// The handler receives DCE/RPC packets and returns DCE/RPC responses.
+// See MS-RPCE for the DCE/RPC packet format.
+//
+// Example usage:
+//
+//	// Create pipe registry and register handlers
+//	registry := smbsys.NewPipeRegistry()
+//	registry.RegisterInterface(smbsys.SamrInterfaceUUID, mySamrHandler)
+//	registry.RegisterInterface(smbsys.NetlogonInterfaceUUID, myNetlogonHandler)
+//
+//	// Start SMB server with pipe registry
+//	sys := smbsys.NewSys()
+//	err := sys.Start(ctx, smbsys.SysOpt{
+//	    Config:        smbsys.DefaultServerConfig(),
+//	    ShareProvider: myShares,
+//	    PipeRegistry:  registry,
+//	    // ...
+//	})
+type RPCInterfaceHandler interface {
+	// HandleBind processes a DCE/RPC BIND request for this interface.
+	// Returns the BIND_ACK response packet or error.
+	// The handler should verify it supports the requested interface.
+	HandleBind(ctx context.Context, bindPacket []byte) ([]byte, error)
+
+	// HandleRequest processes a DCE/RPC REQUEST for this interface.
+	// The opnum identifies the specific operation being called.
+	// Returns the RESPONSE packet or error.
+	HandleRequest(ctx context.Context, opnum uint16, requestPacket []byte) ([]byte, error)
+}
+
+// Well-known RPC interface UUIDs (MS-RPCE wire format: little-endian).
+var (
+	// SAMR interface UUID: 12345778-1234-ABCD-EF00-0123456789AC
+	SamrInterfaceUUID = [16]byte{
+		0x78, 0x57, 0x34, 0x12, 0x34, 0x12, 0xCD, 0xAB,
+		0xEF, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAC,
+	}
+
+	// NetLogon interface UUID: 12345678-1234-ABCD-EF00-01234567CFFB
+	NetlogonInterfaceUUID = [16]byte{
+		0x78, 0x56, 0x34, 0x12, 0x34, 0x12, 0xCD, 0xAB,
+		0xEF, 0x00, 0x01, 0x23, 0x45, 0x67, 0xCF, 0xFB,
+	}
+
+	// LSARPC interface UUID: 12345778-1234-ABCD-EF00-0123456789AB
+	LsarpcInterfaceUUID = [16]byte{
+		0x78, 0x57, 0x34, 0x12, 0x34, 0x12, 0xCD, 0xAB,
+		0xEF, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB,
+	}
+)
+
+// PipeRegistry manages RPC interface handlers for IPC$ share access.
+// Handlers are registered by interface UUID and looked up when processing
+// DCE/RPC BIND requests.
+type PipeRegistry struct {
+	interfaces map[[16]byte]RPCInterfaceHandler
+}
+
+// NewPipeRegistry creates a new pipe registry.
+func NewPipeRegistry() *PipeRegistry {
+	return &PipeRegistry{
+		interfaces: make(map[[16]byte]RPCInterfaceHandler),
 	}
 }
 
-// SetVerbosity sets the verbosity level (0-3).
-func (l *Logger) SetVerbosity(level int) {
-	l.verbosity = level
+// RegisterInterface registers a handler for an RPC interface UUID.
+// Use the well-known UUIDs (SamrInterfaceUUID, etc.) or define custom ones.
+//
+// Common interfaces for domain operations:
+//   - SamrInterfaceUUID - MS-SAMR (user/group management)
+//   - NetlogonInterfaceUUID - MS-NRPC (secure channel)
+//   - LsarpcInterfaceUUID - MS-LSAD (policy/trust)
+func (r *PipeRegistry) RegisterInterface(uuid [16]byte, handler RPCInterfaceHandler) {
+	r.interfaces[uuid] = handler
 }
 
-// EnableArea enables logging for a specific area.
-func (l *Logger) EnableArea(area LogArea) {
-	if l.areas == nil {
-		l.areas = make(map[LogArea]bool)
+// GetHandler returns the handler for an interface UUID, or nil if not registered.
+func (r *PipeRegistry) GetHandler(uuid [16]byte) RPCInterfaceHandler {
+	return r.interfaces[uuid]
+}
+
+// ListInterfaces returns the UUIDs of all registered interfaces.
+func (r *PipeRegistry) ListInterfaces() [][16]byte {
+	uuids := make([][16]byte, 0, len(r.interfaces))
+	for uuid := range r.interfaces {
+		uuids = append(uuids, uuid)
 	}
-	l.areas[area] = true
-}
-
-// DisableArea disables logging for a specific area.
-func (l *Logger) DisableArea(area LogArea) {
-	if l.areas == nil {
-		return
-	}
-	delete(l.areas, area)
-}
-
-func (l *Logger) shouldLog(area LogArea, level int) bool {
-	if !l.enabled || l.output == nil {
-		return false
-	}
-	if level > l.verbosity {
-		return false
-	}
-	if l.areas != nil && !l.areas[area] {
-		return false
-	}
-	return true
-}
-
-func (l *Logger) log(area LogArea, level int, format string, args ...interface{}) {
-	if !l.shouldLog(area, level) {
-		return
-	}
-	msg := fmt.Sprintf(format, args...)
-	fmt.Fprintf(l.output, "%s %s\n", time.Now().Format("2006/01/02 15:04:05"), msg)
-}
-
-// Printf logs a general message at info level.
-func (l *Logger) Printf(area LogArea, format string, args ...interface{}) {
-	l.log(area, 1, format, args...)
-}
-
-// Debugf logs a debug message.
-func (l *Logger) Debugf(area LogArea, format string, args ...interface{}) {
-	l.log(area, 2, format, args...)
-}
-
-// Tracef logs a trace message (most verbose).
-func (l *Logger) Tracef(area LogArea, format string, args ...interface{}) {
-	l.log(area, 3, format, args...)
-}
-
-// Fatalf logs and exits.
-func (l *Logger) Fatalf(format string, args ...interface{}) {
-	if l.output != nil {
-		msg := fmt.Sprintf(format, args...)
-		fmt.Fprintf(l.output, "%s FATAL: %s\n", time.Now().Format("2006/01/02 15:04:05"), msg)
-	}
-	os.Exit(1)
+	return uuids
 }
 
 // --- Handler Errors ---
@@ -374,20 +401,24 @@ type SysOpt struct {
 	ShareProvider         ShareProvider
 	NTLMAuthenticator     NTLMAuthenticator     // For NTLMv2 password-based authentication
 	KerberosAuthenticator KerberosAuthenticator // For Kerberos/SPNEGO authentication
+	PipeRegistry          *PipeRegistry         // For IPC$ named pipe handlers (optional)
 	Logger                *Logger
 }
 
 // Sys is the primary SMB server instance.
 // It encapsulates all state for a single ksmbd server.
+// Sys implements the Server interface.
 type Sys struct {
 	config                ServerConfig
 	shareProvider         ShareProvider
 	ntlmAuthenticator     NTLMAuthenticator
 	kerberosAuthenticator KerberosAuthenticator
+	pipeRegistry          *PipeRegistry
 	logger                *Logger
 
 	// Internal state
 	rpcResponses map[uint32][]byte
+	rpcHandlers  map[uint32]RPCInterfaceHandler // handle -> bound interface handler
 	pendingLogin struct {
 		sync.Mutex
 		handle   uint32
@@ -403,6 +434,7 @@ type Sys struct {
 func NewSys() *Sys {
 	return &Sys{
 		rpcResponses: make(map[uint32][]byte),
+		rpcHandlers:  make(map[uint32]RPCInterfaceHandler),
 		done:         make(chan struct{}),
 	}
 }
@@ -571,8 +603,8 @@ func buildRPCBindAck(callID uint32) []byte {
 	buf.WriteByte(0)                                             // padding for alignment
 
 	// Results array (bytes 40-47)
-	buf.WriteByte(1)          // n_results
-	buf.Write([]byte{0, 0, 0}) // reserved (3 bytes)
+	buf.WriteByte(1)                                  // n_results
+	buf.Write([]byte{0, 0, 0})                        // reserved (3 bytes)
 	binary.Write(buf, binary.LittleEndian, uint16(0)) // result (acceptance)
 	binary.Write(buf, binary.LittleEndian, uint16(0)) // reason
 
@@ -819,6 +851,7 @@ func (s *Sys) Start(ctx context.Context, opt SysOpt) error {
 	s.shareProvider = opt.ShareProvider
 	s.ntlmAuthenticator = opt.NTLMAuthenticator
 	s.kerberosAuthenticator = opt.KerberosAuthenticator
+	s.pipeRegistry = opt.PipeRegistry
 	s.logger = opt.Logger
 	if s.logger == nil {
 		s.logger = NewLogger(nil) // disabled logger
@@ -1247,13 +1280,52 @@ func (s *Sys) handleRpc(seq uint32, payload []byte) error {
 		switch packetType {
 		case rpcPacketTypeBind:
 			s.logger.Debugf(LogAreaRPC, "RPC: BIND received (CallID: %d)", callID)
-			output = buildRPCBindAck(callID)
+
+			// Extract interface UUID from BIND packet (offset 32-47)
+			// BIND structure: header(16) + max_xmit(2) + max_recv(2) + assoc(4) + n_ctx(1) + rsv(3) + ctx_id(2) + n_syn(1) + rsv(1) + UUID(16)
+			if len(rpcIn) >= 48 {
+				var interfaceUUID [16]byte
+				copy(interfaceUUID[:], rpcIn[32:48])
+
+				// Check for registered handler
+				if s.pipeRegistry != nil {
+					if handler := s.pipeRegistry.GetHandler(interfaceUUID); handler != nil {
+						s.logger.Debugf(LogAreaRPC, "RPC: BIND routing to registered handler for interface %x", interfaceUUID)
+						s.rpcHandlers[req.Handle] = handler
+						var err error
+						output, err = handler.HandleBind(context.Background(), rpcIn)
+						if err != nil {
+							s.logger.Printf(LogAreaRPC, "RPC: Handler BIND error: %v", err)
+							// Continue to default handling
+							output = nil
+						}
+					}
+				}
+			}
+
+			// Default: respond with srvsvc BIND_ACK (for share enumeration)
+			if output == nil {
+				output = buildRPCBindAck(callID)
+			}
 		case rpcPacketTypeRequest:
 			opnum := binary.LittleEndian.Uint16(rpcIn[22:24])
 			contextID := binary.LittleEndian.Uint16(rpcIn[20:22])
 			s.logger.Debugf(LogAreaRPC, "RPC: REQUEST received (CallID: %d, ContextID: %d, Opnum: %d)", callID, contextID, opnum)
 
-			if opnum == srvsvcOpnumNetShareEnumAll {
+			// Check for registered handler bound to this handle
+			if handler, ok := s.rpcHandlers[req.Handle]; ok {
+				s.logger.Debugf(LogAreaRPC, "RPC: REQUEST routing to registered handler (Opnum: %d)", opnum)
+				var err error
+				output, err = handler.HandleRequest(context.Background(), opnum, rpcIn)
+				if err != nil {
+					s.logger.Printf(LogAreaRPC, "RPC: Handler REQUEST error: %v", err)
+					// Fall through to default handling
+					output = nil
+				}
+			}
+
+			// Default: handle built-in srvsvc operations
+			if output == nil && opnum == srvsvcOpnumNetShareEnumAll {
 				s.logger.Debugf(LogAreaRPC, "RPC: Handling NetShareEnumAll")
 
 				// Collect shares from provider, filtering out hidden ones

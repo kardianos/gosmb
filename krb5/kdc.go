@@ -6,33 +6,75 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/kardianos/gosmb/smblog"
 )
 
-// ClientAuthenticator authenticates clients for the KDC.
-// Implement this interface to provide custom authentication logic.
-type ClientAuthenticator interface {
-	// Authenticate is called when a client requests a TGT.
-	// Returns the client's password if authentication succeeds, or an error.
-	// The password is used to derive keys and verify pre-authentication.
-	Authenticate(principal, realm string) (password string, err error)
+// PrincipalType identifies the type of Kerberos principal.
+type PrincipalType int
+
+const (
+	// PrincipalUser is a user/client principal (NT-PRINCIPAL).
+	// Examples: "alice", "bob", "admin"
+	// Used when clients request TGTs (AS-REQ).
+	PrincipalUser PrincipalType = iota
+
+	// PrincipalService is a service principal (NT-SRV-INST).
+	// Examples: "cifs/fileserver.example.com", "http/web.example.com", "krbtgt/REALM"
+	// Used when issuing service tickets (TGS-REQ).
+	PrincipalService
+)
+
+func (t PrincipalType) String() string {
+	switch t {
+	case PrincipalUser:
+		return "user"
+	case PrincipalService:
+		return "service"
+	default:
+		return "unknown"
+	}
 }
 
-// ClientAuthenticatorFunc is a function adapter for ClientAuthenticator.
-type ClientAuthenticatorFunc func(principal, realm string) (password string, err error)
-
-func (f ClientAuthenticatorFunc) Authenticate(principal, realm string) (string, error) {
-	return f(principal, realm)
+// PrincipalStore looks up keys for Kerberos principals.
+// Implement this interface to back the KDC with a database, LDAP, Active Directory, etc.
+//
+// This is the core interface for principal management. In Active Directory terms:
+//   - PrincipalUser corresponds to user accounts (e.g., alice@REALM)
+//   - PrincipalService corresponds to machine accounts (e.g., FILESERVER$) and their
+//     registered SPNs (e.g., cifs/fileserver.example.com)
+//
+// Enrollment and key rotation are handled outside the KDC via separate protocols:
+//   - Domain join: MS-RPC over SMB named pipes (\\DC\IPC$\PIPE\samr, \PIPE\netlogon)
+//   - Machine password rotation: MS-NRPC (NetLogon) over SMB
+//   - SPN registration: LDAP modifications to servicePrincipalName attribute
+//
+// NOTE: This implementation only supports AES256-CTS-HMAC-SHA1-96 (etype 18).
+// To extend for multiple encryption types, GetKey would need to accept an etype
+// parameter and return the appropriate pre-computed key for that type.
+type PrincipalStore interface {
+	// GetKey returns the pre-computed AES256 key for a principal.
+	// Keys must be derived using DeriveKey(password, principal, realm).
+	//
+	// For PrincipalUser: called during AS-REQ to verify pre-authentication
+	// and encrypt the AS-REP.
+	//
+	// For PrincipalService: called during TGS-REQ to encrypt the service ticket.
+	// The service principal (e.g., "cifs/fileserver") must be registered.
+	//
+	// Returns an error if the principal is not found or not authorized.
+	GetKey(principalType PrincipalType, principal, realm string) (key []byte, err error)
 }
 
-// ServiceKey represents a service principal's key material.
-type ServiceKey struct {
-	Principal string // e.g., "cifs/server.example.com"
-	Password  string // Used to derive keys
+// PrincipalStoreFunc is a function adapter for PrincipalStore.
+type PrincipalStoreFunc func(principalType PrincipalType, principal, realm string) (key []byte, err error)
+
+func (f PrincipalStoreFunc) GetKey(principalType PrincipalType, principal, realm string) ([]byte, error) {
+	return f(principalType, principal, realm)
 }
 
 // KDCConfig configures the KDC.
@@ -43,18 +85,15 @@ type KDCConfig struct {
 	// ListenAddr is the address to listen on (default ":88").
 	ListenAddr string
 
-	// ClientAuth authenticates clients requesting TGTs.
-	ClientAuth ClientAuthenticator
-
-	// Services maps service principal names to their passwords.
-	// The KDC uses these to encrypt service tickets.
-	Services map[string]string
+	// Principals provides key lookup for users and services.
+	// This is called for both AS-REQ (user authentication) and TGS-REQ (service tickets).
+	Principals PrincipalStore
 
 	// TicketLifetime is how long tickets are valid (default 10 hours).
 	TicketLifetime time.Duration
 
 	// Logger for debug output. If nil, logs are discarded.
-	Logger *log.Logger
+	Logger *smblog.Logger
 }
 
 // KDC is a Kerberos Key Distribution Center.
@@ -81,8 +120,8 @@ func NewKDC(cfg KDCConfig) (*KDC, error) {
 	if cfg.Realm == "" {
 		return nil, fmt.Errorf("realm is required")
 	}
-	if cfg.ClientAuth == nil {
-		return nil, fmt.Errorf("client authenticator is required")
+	if cfg.Principals == nil {
+		return nil, fmt.Errorf("principal store is required")
 	}
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = ":88"
@@ -93,7 +132,7 @@ func NewKDC(cfg KDCConfig) (*KDC, error) {
 
 	// Derive krbtgt key from a fixed password (for testing)
 	// In production, this would be randomly generated and stored securely
-	krbtgtKey, err := DeriveKey(ETypeAES256SHA1, "krbtgt-secret-key", "krbtgt/"+cfg.Realm, cfg.Realm)
+	krbtgtKey, err := deriveKeyFromPassword(eTypeAES256SHA1, "krbtgt-secret-key", "krbtgt/"+cfg.Realm, cfg.Realm)
 	if err != nil {
 		return nil, fmt.Errorf("derive krbtgt key: %w", err)
 	}
@@ -139,8 +178,8 @@ func (k *KDC) Start(ctx context.Context) error {
 
 	// Start handler goroutines
 	k.wg.Add(2)
-	go k.serveUDP()
-	go k.serveTCP()
+	go k.serveUDP(ctx)
+	go k.serveTCP(ctx)
 
 	// Start shutdown watcher
 	go k.watchContext(ctx)
@@ -190,11 +229,6 @@ func (k *KDC) Wait() {
 	<-k.done
 }
 
-// Done returns a channel that is closed when the KDC has fully stopped.
-func (k *KDC) Done() <-chan struct{} {
-	return k.done
-}
-
 // Ready blocks until the KDC is ready to accept connections or the context is cancelled.
 // Returns nil if ready, or the context error if cancelled before ready.
 func (k *KDC) Ready(ctx context.Context) error {
@@ -225,11 +259,16 @@ func (k *KDC) Serve(ctx context.Context) error {
 	return nil
 }
 
-func (k *KDC) serveUDP() {
+func (k *KDC) serveUDP(ctx context.Context) {
 	defer k.wg.Done()
 
 	buf := make([]byte, 65535)
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		n, addr, err := k.udpListener.ReadFromUDP(buf)
 		if err != nil {
 			if k.isRunning() {
@@ -253,10 +292,15 @@ func (k *KDC) serveUDP() {
 	}
 }
 
-func (k *KDC) serveTCP() {
+func (k *KDC) serveTCP(ctx context.Context) {
 	defer k.wg.Done()
 
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		conn, err := k.tcpListener.Accept()
 		if err != nil {
 			if k.isRunning() {
@@ -350,50 +394,40 @@ func (k *KDC) handleASReq(data []byte) ([]byte, error) {
 
 	// Verify realm
 	if !strings.EqualFold(realm, k.config.Realm) {
-		return k.makeKRBError(errClientNotFound, realm, req.ReqBody.CName, req.ReqBody.SName,
-			"realm mismatch")
+		return k.makeKRBError(errClientNotFound, realm, req.ReqBody.CName, req.ReqBody.SName, "realm mismatch")
 	}
 
-	// Authenticate client
-	password, err := k.config.ClientAuth.Authenticate(clientPrincipal, realm)
+	// Get client's pre-computed key from principal store
+	clientKey, err := k.config.Principals.GetKey(PrincipalUser, clientPrincipal, realm)
 	if err != nil {
 		k.log("Client authentication failed for %s: %v", clientPrincipal, err)
-		return k.makeKRBError(errClientNotFound, realm, req.ReqBody.CName, req.ReqBody.SName,
-			"client not found")
+		return k.makeKRBError(errClientNotFound, realm, req.ReqBody.CName, req.ReqBody.SName, "client not found")
 	}
 
-	// Select encryption type (prefer what client supports)
+	// Verify client supports AES256 (we only support this encryption type)
 	etype := k.selectEType(req.ReqBody.EType)
 	if etype == 0 {
-		return k.makeKRBError(errGeneric, realm, req.ReqBody.CName, req.ReqBody.SName,
-			"no supported encryption type")
-	}
-
-	// Derive client key
-	clientKey, err := DeriveKey(etype, password, clientPrincipal, realm)
-	if err != nil {
-		return nil, fmt.Errorf("derive client key: %w", err)
+		return k.makeKRBError(errGeneric, realm, req.ReqBody.CName, req.ReqBody.SName, "no supported encryption type (AES256 required)")
 	}
 	// Check for pre-authentication
 	hasPreAuth := false
 	for _, pa := range req.PAData {
-		if pa.PADataType == paEncTimestamp {
+		if pa.PADataType == paTypeEncTimestamp {
 			// Verify encrypted timestamp
-			var encTS EncryptedData
+			var encTS encryptedData
 			if _, err := asn1.Unmarshal(pa.PADataValue, &encTS); err != nil {
 				k.log("Failed to unmarshal PA-ENC-TIMESTAMP: %v", err)
 				continue
 			}
 
-			tsData, err := Decrypt(EncryptionKey{KeyType: etype, KeyValue: clientKey},
+			tsData, err := decrypt(EncryptionKey{KeyType: etype, KeyValue: clientKey},
 				keyUsageASReqTimestamp, encTS)
 			if err != nil {
 				k.log("Failed to decrypt PA-ENC-TIMESTAMP: %v", err)
-				return k.makeKRBError(errPreAuthFailed, realm, req.ReqBody.CName, req.ReqBody.SName,
-					"pre-authentication failed")
+				return k.makeKRBError(errPreAuthFailed, realm, req.ReqBody.CName, req.ReqBody.SName, "pre-authentication failed")
 			}
 
-			var ts PAEncTimestamp
+			var ts paEncTimestamp
 			if _, err := asn1.Unmarshal(tsData, &ts); err != nil {
 				k.log("Failed to unmarshal timestamp: %v", err)
 				continue
@@ -405,8 +439,7 @@ func (k *KDC) handleASReq(data []byte) ([]byte, error) {
 				diff = -diff
 			}
 			if diff > 5*time.Minute {
-				return k.makeKRBError(errPreAuthFailed, realm, req.ReqBody.CName, req.ReqBody.SName,
-					"timestamp out of range")
+				return k.makeKRBError(errPreAuthFailed, realm, req.ReqBody.CName, req.ReqBody.SName, "timestamp out of range")
 			}
 
 			hasPreAuth = true
@@ -420,7 +453,7 @@ func (k *KDC) handleASReq(data []byte) ([]byte, error) {
 	}
 
 	// Generate session key
-	sessionKey, err := GenerateSessionKey(etype)
+	sessionKey, err := generateSessionKey(etype)
 	if err != nil {
 		return nil, fmt.Errorf("generate session key: %w", err)
 	}
@@ -453,14 +486,13 @@ func (k *KDC) handleTGSReq(data []byte) ([]byte, error) {
 	// Find AP-REQ in PA-DATA (contains the TGT)
 	var apReqData []byte
 	for _, pa := range req.PAData {
-		if pa.PADataType == 1 { // PA-TGS-REQ
+		if pa.PADataType == paTypeTGSReq {
 			apReqData = pa.PADataValue
 			break
 		}
 	}
 	if apReqData == nil {
-		return k.makeKRBError(errGeneric, k.config.Realm, PrincipalName{}, req.ReqBody.SName,
-			"no PA-TGS-REQ")
+		return k.makeKRBError(errGeneric, k.config.Realm, principalName{}, req.ReqBody.SName, "no PA-TGS-REQ")
 	}
 
 	// Parse AP-REQ
@@ -477,15 +509,14 @@ func (k *KDC) handleTGSReq(data []byte) ([]byte, error) {
 
 	// Decrypt TGT
 	tgtKey := EncryptionKey{
-		KeyType:  ETypeAES256SHA1,
+		KeyType:  eTypeAES256SHA1,
 		KeyValue: k.krbtgtKey,
 	}
 
-	ticketData, err := Decrypt(tgtKey, keyUsageTicket, apReqTicket.EncPart)
+	ticketData, err := decrypt(tgtKey, keyUsageTicket, apReqTicket.EncPart)
 	if err != nil {
 		k.log("Failed to decrypt TGT: %v", err)
-		return k.makeKRBError(errBadIntegrity, k.config.Realm, PrincipalName{}, req.ReqBody.SName,
-			"invalid TGT")
+		return k.makeKRBError(errBadIntegrity, k.config.Realm, principalName{}, req.ReqBody.SName, "invalid TGT")
 	}
 
 	// Unmarshal ticket
@@ -493,22 +524,21 @@ func (k *KDC) handleTGSReq(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unwrap EncTicketPart: %w", err)
 	}
-	var encTicket EncTicketPart
+	var encTicket encTicketPart
 	if _, err := asn1.Unmarshal(inner, &encTicket); err != nil {
 		return nil, fmt.Errorf("unmarshal EncTicketPart: %w", err)
 	}
 
 	// Check ticket expiry
 	if time.Now().After(encTicket.EndTime) {
-		return k.makeKRBError(errTicketExpired, k.config.Realm, encTicket.CName, req.ReqBody.SName,
-			"TGT expired")
+		return k.makeKRBError(errTicketExpired, k.config.Realm, encTicket.CName, req.ReqBody.SName, "TGT expired")
 	}
 
 	// Get session key from TGT
 	tgtSessionKey := encTicket.Key
 
-	// Decrypt authenticator (key usage 7 for TGS-REQ)
-	authData, err := Decrypt(tgtSessionKey, 7, apReq.Auth)
+	// Decrypt authenticator
+	authData, err := decrypt(tgtSessionKey, keyUsageTGSReqAuth, apReq.Auth)
 	if err != nil {
 		k.log("Failed to decrypt authenticator: %v", err)
 		return k.makeKRBError(errBadIntegrity, k.config.Realm, encTicket.CName, req.ReqBody.SName,
@@ -520,37 +550,32 @@ func (k *KDC) handleTGSReq(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unwrap authenticator: %w", err)
 	}
-	var auth Authenticator
+	var auth authenticator
 	if _, err := asn1.Unmarshal(inner, &auth); err != nil {
 		return nil, fmt.Errorf("unmarshal authenticator: %w", err)
 	}
 
 	// Verify authenticator matches ticket
 	if auth.CRealm != encTicket.CRealm || auth.CName.String() != encTicket.CName.String() {
-		return k.makeKRBError(errBadIntegrity, k.config.Realm, encTicket.CName, req.ReqBody.SName,
-			"authenticator mismatch")
+		return k.makeKRBError(errBadIntegrity, k.config.Realm, encTicket.CName, req.ReqBody.SName, "authenticator mismatch")
 	}
 
 	// Get service principal
 	servicePrincipal := req.ReqBody.SName.String()
 	k.log("TGS-REQ from %s@%s for %s", encTicket.CName.String(), encTicket.CRealm, servicePrincipal)
 
-	// Look up service key
-	servicePassword, ok := k.config.Services[servicePrincipal]
-	if !ok {
-		return k.makeKRBError(errServiceNotFound, k.config.Realm, encTicket.CName, req.ReqBody.SName,
-			"service not found")
-	}
-
-	// Derive service key
-	etype := tgtSessionKey.KeyType
-	serviceKey, err := DeriveKey(etype, servicePassword, servicePrincipal, k.config.Realm)
+	// Look up pre-computed service key from principal store
+	serviceKeyBytes, err := k.config.Principals.GetKey(PrincipalService, servicePrincipal, k.config.Realm)
 	if err != nil {
-		return nil, fmt.Errorf("derive service key: %w", err)
+		k.log("Service not found: %s: %v", servicePrincipal, err)
+		return k.makeKRBError(errServiceNotFound, k.config.Realm, encTicket.CName, req.ReqBody.SName, "service not found")
 	}
 
-	// Generate new session key for service
-	newSessionKey, err := GenerateSessionKey(etype)
+	// Use AES256 for all service tickets (only supported encryption type)
+	serviceKey := EncryptionKey{KeyType: eTypeAES256SHA1, KeyValue: serviceKeyBytes}
+
+	// Generate new session key for service (AES256 only)
+	newSessionKey, err := generateSessionKey(eTypeAES256SHA1)
 	if err != nil {
 		return nil, fmt.Errorf("generate session key: %w", err)
 	}
@@ -563,7 +588,7 @@ func (k *KDC) handleTGSReq(data []byte) ([]byte, error) {
 	}
 
 	serviceTicket, err := k.buildServiceTicket(encTicket.CName, encTicket.CRealm,
-		req.ReqBody.SName, newSessionKey, EncryptionKey{KeyType: etype, KeyValue: serviceKey},
+		req.ReqBody.SName, newSessionKey, serviceKey,
 		now, endTime)
 	if err != nil {
 		return nil, fmt.Errorf("build service ticket: %w", err)
@@ -580,51 +605,55 @@ func (k *KDC) handleTGSReq(data []byte) ([]byte, error) {
 }
 
 func (k *KDC) selectEType(clientTypes []int32) int32 {
-	// Prefer AES256, then AES128
-	preferred := []int32{ETypeAES256SHA1, ETypeAES128SHA1}
-	for _, pref := range preferred {
-		for _, ct := range clientTypes {
-			if ct == pref {
-				return pref
-			}
+	// This KDC only supports AES256-CTS-HMAC-SHA1-96 (etype 18).
+	// To extend for multiple encryption types:
+	// 1. Change Services from map[string][]byte to map[string]map[int32][]byte
+	//    to store pre-computed keys for each supported etype.
+	// 2. Update ClientAuthenticator.GetKey() to accept an etype parameter
+	//    and return the appropriate key for that encryption type.
+	// 3. Modify this function to negotiate based on what keys are available.
+	// 4. Update handleASReq and handleTGSReq to use the negotiated etype.
+	for _, ct := range clientTypes {
+		if ct == eTypeAES256SHA1 {
+			return eTypeAES256SHA1
 		}
 	}
 	return 0
 }
 
-func (k *KDC) buildTGT(cname PrincipalName, realm string, sessionKey EncryptionKey,
-	authTime, endTime time.Time) (Ticket, error) {
+func (k *KDC) buildTGT(cname principalName, realm string, sessionKey EncryptionKey,
+	authTime, endTime time.Time) (ticket, error) {
 
 	// Build EncTicketPart
-	encPart := EncTicketPart{
+	encPart := encTicketPart{
 		Flags:     asn1.BitString{Bytes: []byte{0x40, 0x80, 0x00, 0x00}, BitLength: 32}, // INITIAL, PRE-AUTHENT
 		Key:       sessionKey,
 		CRealm:    realm,
 		CName:     cname,
-		Transited: TransitedEnc{TRType: 1, Contents: []byte{}},
+		Transited: transitedEnc{TRType: 1, Contents: []byte{}},
 		AuthTime:  authTime,
 		EndTime:   endTime,
 	}
 
 	encPartBytes, err := marshalEncTicketPart(encPart)
 	if err != nil {
-		return Ticket{}, fmt.Errorf("marshal EncTicketPart: %w", err)
+		return ticket{}, fmt.Errorf("marshal EncTicketPart: %w", err)
 	}
 
 	// Encrypt with krbtgt key
 	tgtKey := EncryptionKey{
-		KeyType:  ETypeAES256SHA1,
+		KeyType:  eTypeAES256SHA1,
 		KeyValue: k.krbtgtKey,
 	}
-	encData, err := Encrypt(tgtKey, keyUsageTicket, encPartBytes)
+	encData, err := encrypt(tgtKey, keyUsageTicket, encPartBytes)
 	if err != nil {
-		return Ticket{}, fmt.Errorf("encrypt TGT: %w", err)
+		return ticket{}, fmt.Errorf("encrypt TGT: %w", err)
 	}
 
-	return Ticket{
+	return ticket{
 		TktVNO: 5,
 		Realm:  realm,
-		SName: PrincipalName{
+		SName: principalName{
 			NameType:   nameTypeSrvInst,
 			NameString: []string{"krbtgt", realm},
 		},
@@ -632,30 +661,30 @@ func (k *KDC) buildTGT(cname PrincipalName, realm string, sessionKey EncryptionK
 	}, nil
 }
 
-func (k *KDC) buildServiceTicket(cname PrincipalName, crealm string, sname PrincipalName,
-	sessionKey, serviceKey EncryptionKey, authTime, endTime time.Time) (Ticket, error) {
+func (k *KDC) buildServiceTicket(cname principalName, crealm string, sname principalName,
+	sessionKey, serviceKey EncryptionKey, authTime, endTime time.Time) (ticket, error) {
 
-	encPart := EncTicketPart{
+	encPart := encTicketPart{
 		Flags:     asn1.BitString{Bytes: []byte{0x40, 0x80, 0x00, 0x00}, BitLength: 32},
 		Key:       sessionKey,
 		CRealm:    crealm,
 		CName:     cname,
-		Transited: TransitedEnc{TRType: 1, Contents: []byte{}},
+		Transited: transitedEnc{TRType: 1, Contents: []byte{}},
 		AuthTime:  authTime,
 		EndTime:   endTime,
 	}
 
 	encPartBytes, err := marshalEncTicketPart(encPart)
 	if err != nil {
-		return Ticket{}, fmt.Errorf("marshal EncTicketPart: %w", err)
+		return ticket{}, fmt.Errorf("marshal EncTicketPart: %w", err)
 	}
 
-	encData, err := Encrypt(serviceKey, keyUsageTicket, encPartBytes)
+	encData, err := encrypt(serviceKey, keyUsageTicket, encPartBytes)
 	if err != nil {
-		return Ticket{}, fmt.Errorf("encrypt ticket: %w", err)
+		return ticket{}, fmt.Errorf("encrypt ticket: %w", err)
 	}
 
-	return Ticket{
+	return ticket{
 		TktVNO:  5,
 		Realm:   k.config.Realm,
 		SName:   sname,
@@ -663,8 +692,8 @@ func (k *KDC) buildServiceTicket(cname PrincipalName, crealm string, sname Princ
 	}, nil
 }
 
-func (k *KDC) buildASRep(req *ASReq, clientKey []byte, sessionKey EncryptionKey,
-	ticket Ticket, authTime, endTime time.Time) ([]byte, error) {
+func (k *KDC) buildASRep(req *asReq, clientKey []byte, sessionKey EncryptionKey,
+	ticket ticket, authTime, endTime time.Time) ([]byte, error) {
 
 	// Marshal ticket with APPLICATION 1 tag
 	ticketBytes, err := marshalTicket(ticket)
@@ -673,9 +702,9 @@ func (k *KDC) buildASRep(req *ASReq, clientKey []byte, sessionKey EncryptionKey,
 	}
 
 	// Build EncKDCRepPart
-	encRepPart := EncKDCRepPart{
+	encRepPart := encKDCRepPart{
 		Key:      sessionKey,
-		LastReq:  []LastReqEntry{{LRType: 0, LRValue: authTime}},
+		LastReq:  []lastReqEntry{{LRType: 0, LRValue: authTime}},
 		Nonce:    req.ReqBody.Nonce,
 		Flags:    asn1.BitString{Bytes: []byte{0x40, 0x80, 0x00, 0x00}, BitLength: 32},
 		AuthTime: authTime,
@@ -690,13 +719,12 @@ func (k *KDC) buildASRep(req *ASReq, clientKey []byte, sessionKey EncryptionKey,
 	}
 
 	// Encrypt with client key
-	encData, err := Encrypt(EncryptionKey{KeyType: sessionKey.KeyType, KeyValue: clientKey},
-		keyUsageASRepEncPart, encRepPartBytes)
+	encData, err := encrypt(EncryptionKey{KeyType: sessionKey.KeyType, KeyValue: clientKey}, keyUsageASRepEncPart, encRepPartBytes)
 	if err != nil {
 		return nil, fmt.Errorf("encrypt AS-REP: %w", err)
 	}
 
-	rep := ASRep{
+	rep := asRep{
 		PVNO:        5,
 		MsgType:     msgTypeASRep,
 		CRealm:      req.ReqBody.Realm,
@@ -708,9 +736,9 @@ func (k *KDC) buildASRep(req *ASReq, clientKey []byte, sessionKey EncryptionKey,
 	return marshalASRep(rep)
 }
 
-func (k *KDC) buildTGSRep(req *TGSReq, cname PrincipalName, crealm string,
+func (k *KDC) buildTGSRep(req *tgsReq, cname principalName, crealm string,
 	tgtSessionKey, newSessionKey EncryptionKey,
-	ticket Ticket, authTime, endTime time.Time) ([]byte, error) {
+	ticket ticket, authTime, endTime time.Time) ([]byte, error) {
 
 	// Marshal ticket with APPLICATION 1 tag
 	ticketBytes, err := marshalTicket(ticket)
@@ -719,9 +747,9 @@ func (k *KDC) buildTGSRep(req *TGSReq, cname PrincipalName, crealm string,
 	}
 
 	// Build EncKDCRepPart
-	encRepPart := EncKDCRepPart{
+	encRepPart := encKDCRepPart{
 		Key:      newSessionKey,
-		LastReq:  []LastReqEntry{{LRType: 0, LRValue: authTime}},
+		LastReq:  []lastReqEntry{{LRType: 0, LRValue: authTime}},
 		Nonce:    req.ReqBody.Nonce,
 		Flags:    asn1.BitString{Bytes: []byte{0x40, 0x80, 0x00, 0x00}, BitLength: 32},
 		AuthTime: authTime,
@@ -736,12 +764,12 @@ func (k *KDC) buildTGSRep(req *TGSReq, cname PrincipalName, crealm string,
 	}
 
 	// Encrypt with TGT session key
-	encData, err := Encrypt(tgtSessionKey, keyUsageTGSRepEncPart, encRepPartBytes)
+	encData, err := encrypt(tgtSessionKey, keyUsageTGSRepEncPart, encRepPartBytes)
 	if err != nil {
 		return nil, fmt.Errorf("encrypt TGS-REP: %w", err)
 	}
 
-	rep := TGSRep{
+	rep := tgsRep{
 		PVNO:        5,
 		MsgType:     msgTypeTGSRep,
 		CRealm:      crealm,
@@ -753,9 +781,12 @@ func (k *KDC) buildTGSRep(req *TGSReq, cname PrincipalName, crealm string,
 	return marshalTGSRep(rep)
 }
 
-func (k *KDC) makePreAuthRequired(realm string, cname, sname PrincipalName, etype int32) ([]byte, error) {
-	// Build ETYPE-INFO2 with GeneralString encoding
-	etypeInfo := []ETypeInfo2Entry{{
+func (k *KDC) makePreAuthRequired(realm string, cname, sname principalName, etype int32) ([]byte, error) {
+	// Build ETYPE-INFO2 with GeneralString encoding.
+	// Currently only AES256 is advertised since selectEType only returns AES256.
+	// To support multiple etypes, add additional entries to etypeInfo for each
+	// supported encryption type.
+	etypeInfo := []eTypeInfo2Entry{{
 		EType: etype,
 		Salt:  realm + cname.String(),
 	}}
@@ -767,13 +798,13 @@ func (k *KDC) makePreAuthRequired(realm string, cname, sname PrincipalName, etyp
 
 	// Include both PA-ENC-TIMESTAMP (type 2) as accepted method
 	// and PA-ETYPE-INFO2 (type 19) with etype/salt info
-	errData := []PAData{
+	errData := []paData{
 		{
-			PADataType:  paEncTimestamp, // PA-ENC-TIMESTAMP - indicates this method is accepted
-			PADataValue: nil,            // Empty value - just indicates the method is supported
+			PADataType:  paTypeEncTimestamp, // PA-ENC-TIMESTAMP - indicates this method is accepted
+			PADataValue: nil,                // Empty value - just indicates the method is supported
 		},
 		{
-			PADataType:  paETypeInfo2, // PA-ETYPE-INFO2 - provides etype and salt info
+			PADataType:  paTypeETypeInfo2, // PA-ETYPE-INFO2 - provides etype and salt info
 			PADataValue: etypeInfoBytes,
 		},
 	}
@@ -782,7 +813,7 @@ func (k *KDC) makePreAuthRequired(realm string, cname, sname PrincipalName, etyp
 		return nil, err
 	}
 
-	krbErr := KRBError{
+	krbErr := krbError{
 		PVNO:      5,
 		MsgType:   msgTypeError,
 		STime:     time.Now().UTC(),
@@ -802,8 +833,8 @@ func (k *KDC) makePreAuthRequired(realm string, cname, sname PrincipalName, etyp
 	return data, nil
 }
 
-func (k *KDC) makeKRBError(code int32, realm string, cname, sname PrincipalName, text string) ([]byte, error) {
-	krbErr := KRBError{
+func (k *KDC) makeKRBError(code int32, realm string, cname, sname principalName, text string) ([]byte, error) {
+	krbErr := krbError{
 		PVNO:      5,
 		MsgType:   msgTypeError,
 		STime:     time.Now().UTC(),
@@ -820,7 +851,7 @@ func (k *KDC) makeKRBError(code int32, realm string, cname, sname PrincipalName,
 }
 
 func (k *KDC) makeErrorResponse(err error) []byte {
-	resp, _ := k.makeKRBError(errGeneric, k.config.Realm, PrincipalName{}, PrincipalName{}, err.Error())
+	resp, _ := k.makeKRBError(errGeneric, k.config.Realm, principalName{}, principalName{}, err.Error())
 	return resp
 }
 
@@ -830,8 +861,8 @@ func (k *KDC) isRunning() bool {
 	return k.running
 }
 
-func (k *KDC) log(format string, args ...interface{}) {
+func (k *KDC) log(format string, args ...any) {
 	if k.config.Logger != nil {
-		k.config.Logger.Printf("[KDC] "+format, args...)
+		k.config.Logger.Printf(smblog.AreaAuth, "[KDC] "+format, args...)
 	}
 }

@@ -14,8 +14,8 @@ import (
 
 // Encryption type constants
 const (
-	ETypeAES256SHA1 = 18 // aes256-cts-hmac-sha1-96
-	ETypeAES128SHA1 = 17 // aes128-cts-hmac-sha1-96
+	eTypeAES256SHA1 = 18 // aes256-cts-hmac-sha1-96
+	eTypeAES128SHA1 = 17 // aes128-cts-hmac-sha1-96
 )
 
 // Key sizes for each encryption type
@@ -25,21 +25,38 @@ const (
 	aesBlockSize  = 16
 )
 
-// DeriveKey derives a Kerberos key from a password using string2key.
-// For AES encryption types, this uses PBKDF2 followed by DK per RFC 3962.
-func DeriveKey(etype int32, password, principal, realm string) ([]byte, error) {
-	return DeriveKeyDebug(etype, password, principal, realm, false)
+// DeriveKey derives a Kerberos AES256 key from a password using string2key.
+// The salt is formed as realm + principal (e.g., "EXAMPLE.COMalice").
+// This uses PBKDF2 with SHA1 and 4096 iterations, followed by the Kerberos DK
+// function per RFC 3962.
+//
+// Use this function to pre-compute keys for the KDC's ClientAuthenticator and
+// Services map. The returned key should be stored securely and never the
+// plaintext password.
+//
+// Example:
+//
+//	key, err := krb5.DeriveKey("mypassword", "alice", "EXAMPLE.COM")
+//	// Store key securely, use in ClientAuthenticator.GetKey()
+func DeriveKey(password, principal, realm string) ([]byte, error) {
+	return deriveKeyFromPassword(eTypeAES256SHA1, password, principal, realm)
 }
 
-// DeriveKeyDebug is like DeriveKey but with optional debug output.
-func DeriveKeyDebug(etype int32, password, principal, realm string, debug bool) ([]byte, error) {
+// deriveKeyFromPassword derives a Kerberos key from a password using string2key.
+// For AES encryption types, this uses PBKDF2 followed by DK per RFC 3962.
+func deriveKeyFromPassword(etype int32, password, principal, realm string) ([]byte, error) {
+	return deriveKeyFromPasswordDebug(etype, password, principal, realm, false)
+}
+
+// deriveKeyFromPasswordDebug is like deriveKeyFromPassword but with optional debug output.
+func deriveKeyFromPasswordDebug(etype int32, password, principal, realm string, debug bool) ([]byte, error) {
 	salt := realm + principal
 
 	var keySize int
 	switch etype {
-	case ETypeAES256SHA1:
+	case eTypeAES256SHA1:
 		keySize = aes256KeySize
-	case ETypeAES128SHA1:
+	case eTypeAES128SHA1:
 		keySize = aes128KeySize
 	default:
 		return nil, fmt.Errorf("unsupported encryption type: %d", etype)
@@ -67,13 +84,13 @@ func DeriveKeyDebug(etype int32, password, principal, realm string, debug bool) 
 	return key, err
 }
 
-// GenerateSessionKey generates a random session key for the given encryption type.
-func GenerateSessionKey(etype int32) (EncryptionKey, error) {
+// generateSessionKey generates a random session key for the given encryption type.
+func generateSessionKey(etype int32) (EncryptionKey, error) {
 	var keySize int
 	switch etype {
-	case ETypeAES256SHA1:
+	case eTypeAES256SHA1:
 		keySize = aes256KeySize
-	case ETypeAES128SHA1:
+	case eTypeAES128SHA1:
 		keySize = aes128KeySize
 	default:
 		return EncryptionKey{}, fmt.Errorf("unsupported encryption type: %d", etype)
@@ -90,19 +107,19 @@ func GenerateSessionKey(etype int32) (EncryptionKey, error) {
 	}, nil
 }
 
-// Encrypt encrypts plaintext using the specified key and key usage.
+// encrypt encrypts plaintext using the specified key and key usage.
 // Returns EncryptedData suitable for Kerberos messages.
-func Encrypt(key EncryptionKey, usage int, plaintext []byte) (EncryptedData, error) {
+func encrypt(key EncryptionKey, usage int, plaintext []byte) (encryptedData, error) {
 	// Derive encryption and HMAC keys from the base key
 	ke, ki, err := deriveKeys(key.KeyValue, key.KeyType, usage)
 	if err != nil {
-		return EncryptedData{}, err
+		return encryptedData{}, err
 	}
 
 	// Generate random confounder (one block)
 	confounder := make([]byte, aesBlockSize)
 	if _, err := rand.Read(confounder); err != nil {
-		return EncryptedData{}, err
+		return encryptedData{}, err
 	}
 
 	// Plaintext = confounder || data (no padding for CTS)
@@ -111,7 +128,7 @@ func Encrypt(key EncryptionKey, usage int, plaintext []byte) (EncryptedData, err
 	// Encrypt with AES-CTS
 	ciphertext, err := aesCTSEncrypt(ke, plainBytes)
 	if err != nil {
-		return EncryptedData{}, err
+		return encryptedData{}, err
 	}
 
 	// Calculate HMAC over plaintext (confounder + message), not ciphertext
@@ -123,19 +140,19 @@ func Encrypt(key EncryptionKey, usage int, plaintext []byte) (EncryptedData, err
 	// Final ciphertext = encrypted data || truncated HMAC
 	result := append(ciphertext, mac...)
 
-	return EncryptedData{
+	return encryptedData{
 		EType:  key.KeyType,
 		Cipher: result,
 	}, nil
 }
 
-// Decrypt decrypts ciphertext using the specified key and key usage.
-func Decrypt(key EncryptionKey, usage int, enc EncryptedData) ([]byte, error) {
-	return DecryptDebug(key, usage, enc, false)
+// decrypt decrypts ciphertext using the specified key and key usage.
+func decrypt(key EncryptionKey, usage int, enc encryptedData) ([]byte, error) {
+	return decryptDebug(key, usage, enc, false)
 }
 
-// DecryptDebug is like Decrypt but with optional debug output.
-func DecryptDebug(key EncryptionKey, usage int, enc EncryptedData, debug bool) ([]byte, error) {
+// decryptDebug is like decrypt but with optional debug output.
+func decryptDebug(key EncryptionKey, usage int, enc encryptedData, debug bool) ([]byte, error) {
 	if key.KeyType != enc.EType {
 		return nil, fmt.Errorf("key type mismatch: key=%d, encrypted=%d", key.KeyType, enc.EType)
 	}

@@ -3,38 +3,65 @@ package krb5
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/kardianos/gosmb/smblog"
 )
 
-// testClientAuth is a simple client authenticator for testing.
-type testClientAuth struct {
-	users map[string]string // principal -> password
+// testPrincipalStore is a simple principal store for testing.
+// It stores pre-computed AES256 keys for both users and services.
+type testPrincipalStore struct {
+	users    map[string][]byte // user principal -> key
+	services map[string][]byte // service principal -> key
 }
 
-func (a *testClientAuth) Authenticate(principal, realm string) (string, error) {
-	if pw, ok := a.users[principal]; ok {
-		return pw, nil
+func (s *testPrincipalStore) GetKey(principalType PrincipalType, principal, realm string) ([]byte, error) {
+	switch principalType {
+	case PrincipalUser:
+		if key, ok := s.users[principal]; ok {
+			return key, nil
+		}
+		return nil, fmt.Errorf("user not found: %s", principal)
+	case PrincipalService:
+		if key, ok := s.services[principal]; ok {
+			return key, nil
+		}
+		return nil, fmt.Errorf("service not found: %s", principal)
+	default:
+		return nil, fmt.Errorf("unknown principal type: %v", principalType)
 	}
-	return "", fmt.Errorf("user not found: %s", principal)
+}
+
+// newTestPrincipalStore creates a test principal store with keys derived from passwords.
+func newTestPrincipalStore(realm string, users, services map[string]string) *testPrincipalStore {
+	store := &testPrincipalStore{
+		users:    make(map[string][]byte),
+		services: make(map[string][]byte),
+	}
+	for principal, password := range users {
+		key, _ := DeriveKey(password, principal, realm)
+		store.users[principal] = key
+	}
+	for principal, password := range services {
+		key, _ := DeriveKey(password, principal, realm)
+		store.services[principal] = key
+	}
+	return store
 }
 
 func TestKDCBasic(t *testing.T) {
+	realm := "TEST.LOCAL"
 	// Create KDC
 	kdc, err := NewKDC(KDCConfig{
-		Realm:      "TEST.LOCAL",
+		Realm:      realm,
 		ListenAddr: "127.0.0.1:0", // Random port
-		ClientAuth: &testClientAuth{
-			users: map[string]string{
-				"testuser": "testpassword",
-			},
-		},
-		Services: map[string]string{
-			"cifs/server.test.local": "service-password",
-		},
-		Logger: log.New(os.Stderr, "", log.LstdFlags),
+		Principals: newTestPrincipalStore(realm,
+			map[string]string{"testuser": "testpassword"},
+			map[string]string{"cifs/server.test.local": "service-password"},
+		),
+		Logger: smblog.New(os.Stderr),
 	})
 	if err != nil {
 		t.Fatalf("NewKDC: %v", err)
@@ -92,16 +119,12 @@ func TestKDCFullFlow(t *testing.T) {
 	kdc, err := NewKDC(KDCConfig{
 		Realm:      realm,
 		ListenAddr: "127.0.0.1:0",
-		ClientAuth: &testClientAuth{
-			users: map[string]string{
-				clientPrincipal: clientPassword,
-			},
-		},
-		Services: map[string]string{
-			servicePrincipal: servicePassword,
-		},
+		Principals: newTestPrincipalStore(realm,
+			map[string]string{clientPrincipal: clientPassword},
+			map[string]string{servicePrincipal: servicePassword},
+		),
 		TicketLifetime: 1 * time.Hour,
-		Logger:         log.New(os.Stderr, "", log.LstdFlags),
+		Logger:         smblog.New(os.Stderr),
 	})
 	if err != nil {
 		t.Fatalf("NewKDC: %v", err)
@@ -172,15 +195,14 @@ func TestKDCFullFlow(t *testing.T) {
 }
 
 func TestKDCInvalidUser(t *testing.T) {
+	realm := "TEST.LOCAL"
 	kdc, err := NewKDC(KDCConfig{
-		Realm:      "TEST.LOCAL",
+		Realm:      realm,
 		ListenAddr: "127.0.0.1:0",
-		ClientAuth: &testClientAuth{
-			users: map[string]string{
-				"validuser": "password",
-			},
-		},
-		Services: map[string]string{},
+		Principals: newTestPrincipalStore(realm,
+			map[string]string{"validuser": "password"},
+			map[string]string{},
+		),
 	})
 	if err != nil {
 		t.Fatalf("NewKDC: %v", err)
@@ -210,17 +232,14 @@ func TestKDCInvalidUser(t *testing.T) {
 }
 
 func TestKDCInvalidPassword(t *testing.T) {
+	realm := "TEST.LOCAL"
 	kdc, err := NewKDC(KDCConfig{
-		Realm:      "TEST.LOCAL",
+		Realm:      realm,
 		ListenAddr: "127.0.0.1:0",
-		ClientAuth: &testClientAuth{
-			users: map[string]string{
-				"testuser": "correctpassword",
-			},
-		},
-		Services: map[string]string{
-			"test/service": "svc-password",
-		},
+		Principals: newTestPrincipalStore(realm,
+			map[string]string{"testuser": "correctpassword"},
+			map[string]string{"test/service": "svc-password"},
+		),
 	})
 	if err != nil {
 		t.Fatalf("NewKDC: %v", err)
@@ -251,19 +270,19 @@ func TestKDCInvalidPassword(t *testing.T) {
 
 func TestCryptoRoundtrip(t *testing.T) {
 	// Test encryption/decryption roundtrip
-	key, err := GenerateSessionKey(ETypeAES256SHA1)
+	key, err := generateSessionKey(eTypeAES256SHA1)
 	if err != nil {
 		t.Fatalf("GenerateSessionKey: %v", err)
 	}
 
 	plaintext := []byte("Hello, Kerberos! This is a test message.")
 
-	encrypted, err := Encrypt(key, 1, plaintext)
+	encrypted, err := encrypt(key, 1, plaintext)
 	if err != nil {
 		t.Fatalf("Encrypt: %v", err)
 	}
 
-	decrypted, err := Decrypt(key, 1, encrypted)
+	decrypted, err := decrypt(key, 1, encrypted)
 	if err != nil {
 		t.Fatalf("Decrypt: %v", err)
 	}
@@ -275,12 +294,12 @@ func TestCryptoRoundtrip(t *testing.T) {
 
 func TestKeyDerivation(t *testing.T) {
 	// Test that key derivation is deterministic
-	key1, err := DeriveKey(ETypeAES256SHA1, "password", "user", "REALM")
+	key1, err := deriveKeyFromPassword(eTypeAES256SHA1, "password", "user", "REALM")
 	if err != nil {
 		t.Fatalf("DeriveKey 1: %v", err)
 	}
 
-	key2, err := DeriveKey(ETypeAES256SHA1, "password", "user", "REALM")
+	key2, err := deriveKeyFromPassword(eTypeAES256SHA1, "password", "user", "REALM")
 	if err != nil {
 		t.Fatalf("DeriveKey 2: %v", err)
 	}
@@ -290,7 +309,7 @@ func TestKeyDerivation(t *testing.T) {
 	}
 
 	// Different inputs should produce different keys
-	key3, _ := DeriveKey(ETypeAES256SHA1, "different", "user", "REALM")
+	key3, _ := deriveKeyFromPassword(eTypeAES256SHA1, "different", "user", "REALM")
 	if string(key1) == string(key3) {
 		t.Error("Different passwords produced same key")
 	}

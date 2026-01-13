@@ -40,7 +40,7 @@ func NewServiceAuthenticator(cfg ServiceAuthenticatorConfig) (*ServiceAuthentica
 	}
 
 	// Derive key from password
-	key, err := DeriveKey(ETypeAES256SHA1, cfg.Password, cfg.Principal, cfg.Realm)
+	key, err := deriveKeyFromPassword(eTypeAES256SHA1, cfg.Password, cfg.Principal, cfg.Realm)
 	if err != nil {
 		return nil, fmt.Errorf("derive key: %w", err)
 	}
@@ -49,7 +49,7 @@ func NewServiceAuthenticator(cfg ServiceAuthenticatorConfig) (*ServiceAuthentica
 		principal: cfg.Principal,
 		realm:     cfg.Realm,
 		key:       key,
-		etype:     ETypeAES256SHA1,
+		etype:     eTypeAES256SHA1,
 	}, nil
 }
 
@@ -89,7 +89,7 @@ func (s *ServiceAuthenticator) ValidateAPReq(apReqBytes []byte) (*ServiceAuthRes
 		KeyValue: s.key,
 	}
 
-	ticketData, err := Decrypt(serviceKey, keyUsageTicket, ticket.EncPart)
+	ticketData, err := decrypt(serviceKey, keyUsageTicket, ticket.EncPart)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt ticket: %w", err)
 	}
@@ -100,7 +100,7 @@ func (s *ServiceAuthenticator) ValidateAPReq(apReqBytes []byte) (*ServiceAuthRes
 		return nil, fmt.Errorf("unwrap EncTicketPart: %w", err)
 	}
 
-	var encTicket EncTicketPart
+	var encTicket encTicketPart
 	if _, err := asn1.Unmarshal(inner, &encTicket); err != nil {
 		return nil, fmt.Errorf("unmarshal EncTicketPart: %w", err)
 	}
@@ -114,7 +114,7 @@ func (s *ServiceAuthenticator) ValidateAPReq(apReqBytes []byte) (*ServiceAuthRes
 	sessionKey := encTicket.Key
 
 	// Decrypt authenticator
-	authData, err := Decrypt(sessionKey, keyUsageAPReqAuth, apReq.Auth)
+	authData, err := decrypt(sessionKey, keyUsageAPReqAuth, apReq.Auth)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt authenticator: %w", err)
 	}
@@ -125,7 +125,7 @@ func (s *ServiceAuthenticator) ValidateAPReq(apReqBytes []byte) (*ServiceAuthRes
 		return nil, fmt.Errorf("unwrap authenticator: %w", err)
 	}
 
-	var auth Authenticator
+	var auth authenticator
 	if _, err := asn1.Unmarshal(authInner, &auth); err != nil {
 		return nil, fmt.Errorf("unmarshal authenticator: %w", err)
 	}
@@ -174,9 +174,9 @@ func (s *ServiceAuthenticator) ValidateAPReq(apReqBytes []byte) (*ServiceAuthRes
 	}, nil
 }
 
-func (s *ServiceAuthenticator) buildAPRep(auth Authenticator, sessionKey EncryptionKey) ([]byte, error) {
+func (s *ServiceAuthenticator) buildAPRep(auth authenticator, sessionKey EncryptionKey) ([]byte, error) {
 	// Build EncAPRepPart
-	encPart := EncAPRepPart{
+	encPart := encAPRepPart{
 		CTime: auth.CTime,
 		CUSec: auth.CUSec,
 	}
@@ -192,13 +192,13 @@ func (s *ServiceAuthenticator) buildAPRep(auth Authenticator, sessionKey Encrypt
 	}
 
 	// Encrypt with session key
-	encData, err := Encrypt(sessionKey, keyUsageAPRepEncPart, encPartBytes)
+	encData, err := encrypt(sessionKey, keyUsageAPRepEncPart, encPartBytes)
 	if err != nil {
 		return nil, fmt.Errorf("encrypt AP-REP: %w", err)
 	}
 
 	// Build AP-REP
-	apRep := APRep{
+	apRep := apRep{
 		PVNO:    5,
 		MsgType: msgTypeAPRep,
 		EncPart: encData,

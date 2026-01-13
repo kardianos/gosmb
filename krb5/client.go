@@ -58,10 +58,10 @@ func (c *Client) GetAPReq(servicePrincipal string) ([]byte, EncryptionKey, error
 
 	// Build authenticator
 	now := time.Now().UTC()
-	auth := Authenticator{
+	auth := authenticator{
 		AuthVNO: 5,
 		CRealm:  c.realm,
-		CName: PrincipalName{
+		CName: principalName{
 			NameType:   nameTypePrincipal,
 			NameString: []string{c.principal},
 		},
@@ -75,13 +75,13 @@ func (c *Client) GetAPReq(servicePrincipal string) ([]byte, EncryptionKey, error
 	}
 
 	// Encrypt authenticator with session key
-	encAuth, err := Encrypt(sessionKey, keyUsageAPReqAuth, authBytes)
+	encAuth, err := encrypt(sessionKey, keyUsageAPReqAuth, authBytes)
 	if err != nil {
 		return nil, EncryptionKey{}, fmt.Errorf("encrypt authenticator: %w", err)
 	}
 
 	// Build AP-REQ (ticketBytes already has APPLICATION 1 tag)
-	apReq := APReq{
+	apReq := apReq{
 		PVNO:        5,
 		MsgType:     msgTypeAPReq,
 		APOptions:   asn1.BitString{Bytes: []byte{0x20, 0x00, 0x00, 0x00}, BitLength: 32}, // MUTUAL-REQUIRED
@@ -104,24 +104,24 @@ func (c *Client) getTGT() error {
 		return err
 	}
 
-	reqBody := KDCReqBody{
+	reqBody := kdcReqBody{
 		KDCOptions: asn1.BitString{Bytes: []byte{0x40, 0x80, 0x00, 0x00}, BitLength: 32},
-		CName: PrincipalName{
+		CName: principalName{
 			NameType:   nameTypePrincipal,
 			NameString: []string{c.principal},
 		},
 		Realm: c.realm,
-		SName: PrincipalName{
+		SName: principalName{
 			NameType:   nameTypeSrvInst,
 			NameString: []string{"krbtgt", c.realm},
 		},
 		Till:  time.Now().Add(24 * time.Hour).UTC(),
 		Nonce: nonce,
-		EType: []int32{ETypeAES256SHA1, ETypeAES128SHA1},
+		EType: []int32{eTypeAES256SHA1, eTypeAES128SHA1},
 	}
 
 	// First request without pre-auth
-	asReq := ASReq{
+	asReq := asReq{
 		PVNO:    5,
 		MsgType: msgTypeASReq,
 		ReqBody: reqBody,
@@ -138,7 +138,7 @@ func (c *Client) getTGT() error {
 		return err
 	}
 
-	var etype int32 = ETypeAES256SHA1 // default
+	var etype int32 = eTypeAES256SHA1 // default
 
 	if msgType == msgTypeError {
 		// Parse error to get etype info
@@ -146,7 +146,7 @@ func (c *Client) getTGT() error {
 		if err != nil {
 			return fmt.Errorf("unwrap error: %w", err)
 		}
-		var krbErr KRBError
+		var krbErr krbError
 		if _, err := asn1.Unmarshal(inner, &krbErr); err != nil {
 			return fmt.Errorf("unmarshal error: %w", err)
 		}
@@ -157,11 +157,11 @@ func (c *Client) getTGT() error {
 
 		// Parse ETYPE-INFO2 from error data
 		if len(krbErr.EData) > 0 {
-			var paData []PAData
+			var paData []paData
 			if _, err := asn1.Unmarshal(krbErr.EData, &paData); err == nil {
 				for _, pa := range paData {
-					if pa.PADataType == paETypeInfo2 {
-						var info []ETypeInfo2Entry
+					if pa.PADataType == paTypeETypeInfo2 {
+						var info []eTypeInfo2Entry
 						if _, err := asn1.Unmarshal(pa.PADataValue, &info); err == nil && len(info) > 0 {
 							etype = info[0].EType
 						}
@@ -178,16 +178,16 @@ func (c *Client) getTGT() error {
 	return c.processASRep(resp, etype)
 }
 
-func (c *Client) getTGTWithPreAuth(reqBody KDCReqBody, etype int32) error {
+func (c *Client) getTGTWithPreAuth(reqBody kdcReqBody, etype int32) error {
 	// Derive key from password
-	clientKey, err := DeriveKey(etype, c.password, c.principal, c.realm)
+	clientKey, err := deriveKeyFromPassword(etype, c.password, c.principal, c.realm)
 	if err != nil {
 		return fmt.Errorf("derive key: %w", err)
 	}
 
 	// Build encrypted timestamp
 	now := time.Now().UTC()
-	ts := PAEncTimestamp{
+	ts := paEncTimestamp{
 		PATimestamp: now,
 		PAUSec:      now.Nanosecond() / 1000,
 	}
@@ -196,7 +196,7 @@ func (c *Client) getTGTWithPreAuth(reqBody KDCReqBody, etype int32) error {
 		return fmt.Errorf("marshal timestamp: %w", err)
 	}
 
-	encTS, err := Encrypt(EncryptionKey{KeyType: etype, KeyValue: clientKey},
+	encTS, err := encrypt(EncryptionKey{KeyType: etype, KeyValue: clientKey},
 		keyUsageASReqTimestamp, tsBytes)
 	if err != nil {
 		return fmt.Errorf("encrypt timestamp: %w", err)
@@ -211,11 +211,11 @@ func (c *Client) getTGTWithPreAuth(reqBody KDCReqBody, etype int32) error {
 	nonce, _ := randomNonce()
 	reqBody.Nonce = nonce
 
-	asReq := ASReq{
+	asReq := asReq{
 		PVNO:    5,
 		MsgType: msgTypeASReq,
-		PAData: []PAData{{
-			PADataType:  paEncTimestamp,
+		PAData: []paData{{
+			PADataType:  paTypeEncTimestamp,
 			PADataValue: encTSBytes,
 		}},
 		ReqBody: reqBody,
@@ -234,7 +234,7 @@ func (c *Client) getTGTWithPreAuth(reqBody KDCReqBody, etype int32) error {
 
 	if msgType == msgTypeError {
 		inner, _, _ := unwrapAppTag(resp)
-		var krbErr KRBError
+		var krbErr krbError
 		asn1.Unmarshal(inner, &krbErr)
 		return fmt.Errorf("KDC error: %d - %s", krbErr.ErrorCode, krbErr.EText)
 	}
@@ -249,12 +249,12 @@ func (c *Client) processASRep(data []byte, etype int32) error {
 	}
 
 	// Derive key and decrypt encrypted part
-	clientKey, err := DeriveKey(etype, c.password, c.principal, c.realm)
+	clientKey, err := deriveKeyFromPassword(etype, c.password, c.principal, c.realm)
 	if err != nil {
 		return fmt.Errorf("derive key: %w", err)
 	}
 
-	encPartData, err := Decrypt(EncryptionKey{KeyType: etype, KeyValue: clientKey},
+	encPartData, err := decrypt(EncryptionKey{KeyType: etype, KeyValue: clientKey},
 		keyUsageASRepEncPart, rep.EncPart)
 	if err != nil {
 		return fmt.Errorf("decrypt AS-REP: %w", err)
@@ -266,7 +266,7 @@ func (c *Client) processASRep(data []byte, etype int32) error {
 		return fmt.Errorf("unwrap EncKDCRepPart: %w", err)
 	}
 
-	var encPart EncKDCRepPart
+	var encPart encKDCRepPart
 	if _, err := asn1.Unmarshal(encInner, &encPart); err != nil {
 		return fmt.Errorf("unmarshal EncKDCRepPart: %w", err)
 	}
@@ -286,7 +286,7 @@ func (c *Client) getServiceTicket(servicePrincipal string) ([]byte, EncryptionKe
 	// Parse service principal (format: "service/host")
 	sname := parsePrincipal(servicePrincipal)
 
-	reqBody := KDCReqBody{
+	reqBody := kdcReqBody{
 		KDCOptions: asn1.BitString{Bytes: []byte{0x40, 0x80, 0x00, 0x00}, BitLength: 32},
 		Realm:      c.realm,
 		SName:      sname,
@@ -301,11 +301,11 @@ func (c *Client) getServiceTicket(servicePrincipal string) ([]byte, EncryptionKe
 		return nil, EncryptionKey{}, fmt.Errorf("build TGS AP-REQ: %w", err)
 	}
 
-	tgsReq := TGSReq{
+	tgsReq := tgsReq{
 		PVNO:    5,
 		MsgType: msgTypeTGSReq,
-		PAData: []PAData{{
-			PADataType:  1, // PA-TGS-REQ
+		PAData: []paData{{
+			PADataType:  paTypeTGSReq,
 			PADataValue: apReqBytes,
 		}},
 		ReqBody: reqBody,
@@ -324,7 +324,7 @@ func (c *Client) getServiceTicket(servicePrincipal string) ([]byte, EncryptionKe
 
 	if msgType == msgTypeError {
 		inner, _, _ := unwrapAppTag(resp)
-		var krbErr KRBError
+		var krbErr krbError
 		asn1.Unmarshal(inner, &krbErr)
 		return nil, EncryptionKey{}, fmt.Errorf("KDC error: %d - %s", krbErr.ErrorCode, krbErr.EText)
 	}
@@ -336,7 +336,7 @@ func (c *Client) getServiceTicket(servicePrincipal string) ([]byte, EncryptionKe
 	}
 
 	// Decrypt encrypted part with TGT session key
-	encPartData, err := Decrypt(c.tgtKey, keyUsageTGSRepEncPart, rep.EncPart)
+	encPartData, err := decrypt(c.tgtKey, keyUsageTGSRepEncPart, rep.EncPart)
 	if err != nil {
 		return nil, EncryptionKey{}, fmt.Errorf("decrypt TGS-REP: %w", err)
 	}
@@ -347,7 +347,7 @@ func (c *Client) getServiceTicket(servicePrincipal string) ([]byte, EncryptionKe
 		return nil, EncryptionKey{}, fmt.Errorf("unwrap EncKDCRepPart: %w", err)
 	}
 
-	var encPart EncKDCRepPart
+	var encPart encKDCRepPart
 	if _, err := asn1.Unmarshal(encInner, &encPart); err != nil {
 		return nil, EncryptionKey{}, fmt.Errorf("unmarshal EncKDCRepPart: %w", err)
 	}
@@ -359,10 +359,10 @@ func (c *Client) getServiceTicket(servicePrincipal string) ([]byte, EncryptionKe
 func (c *Client) buildTGSAPReq() ([]byte, error) {
 	// Build authenticator
 	now := time.Now().UTC()
-	auth := Authenticator{
+	auth := authenticator{
 		AuthVNO: 5,
 		CRealm:  c.realm,
-		CName: PrincipalName{
+		CName: principalName{
 			NameType:   nameTypePrincipal,
 			NameString: []string{c.principal},
 		},
@@ -375,14 +375,14 @@ func (c *Client) buildTGSAPReq() ([]byte, error) {
 		return nil, fmt.Errorf("marshal authenticator: %w", err)
 	}
 
-	// Encrypt authenticator with TGT session key (usage 7 for TGS-REQ)
-	encAuth, err := Encrypt(c.tgtKey, 7, authBytes)
+	// Encrypt authenticator with TGT session key
+	encAuth, err := encrypt(c.tgtKey, keyUsageTGSReqAuth, authBytes)
 	if err != nil {
 		return nil, fmt.Errorf("encrypt authenticator: %w", err)
 	}
 
 	// Use TGT bytes directly (preserves APPLICATION 1 tag)
-	apReq := APReq{
+	apReq := apReq{
 		PVNO:        5,
 		MsgType:     msgTypeAPReq,
 		APOptions:   asn1.BitString{Bytes: []byte{0x00, 0x00, 0x00, 0x00}, BitLength: 32},
@@ -399,9 +399,9 @@ func (c *Client) sendKDCRequest(req interface{}, msgType int) ([]byte, error) {
 
 	switch msgType {
 	case msgTypeASReq:
-		data, err = marshalASReq(req.(ASReq))
+		data, err = marshalASReq(req.(asReq))
 	case msgTypeTGSReq:
-		data, err = marshalTGSReq(req.(TGSReq))
+		data, err = marshalTGSReq(req.(tgsReq))
 	default:
 		return nil, fmt.Errorf("unsupported request type: %d", msgType)
 	}
@@ -456,15 +456,15 @@ func randomNonce() (int64, error) {
 	return int64(binary.BigEndian.Uint32(buf[:]) & 0x7FFFFFFF), nil
 }
 
-func parsePrincipal(s string) PrincipalName {
+func parsePrincipal(s string) principalName {
 	parts := splitPrincipal(s)
 	if len(parts) == 1 {
-		return PrincipalName{
+		return principalName{
 			NameType:   nameTypePrincipal,
 			NameString: parts,
 		}
 	}
-	return PrincipalName{
+	return principalName{
 		NameType:   nameTypeSrvInst,
 		NameString: parts,
 	}
